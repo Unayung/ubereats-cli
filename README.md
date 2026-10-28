@@ -20,7 +20,7 @@ ubereats whoami | logout
 The session is checked with `getUserV1` before saving. Stored in
 `~/.config/ubereats/state.json` (0600, `UBEREATS_HOME` to move it), or the OS keyring with
 `--keyring` (macOS `security`, Linux `secret-tool`). `UBEREATS_COOKIE` overrides both.
-An expired `jwt-session` gives a warning and exit code 3.
+An expired `jwt-session` prints a warning; calls that need login then fail with exit code 3.
 
 ## Address
 
@@ -31,13 +31,12 @@ ubereats address set '民生東路三段128號' --lat 25.0576 --lng 121.5460
 Sent as the `uev2.loc` cookie; changes ETA, delivery range and search ranking.
 
 ```
-ubereats doctor [--via auto|http|browser]
-ubereats doctor                       # browser, API, login state
+ubereats doctor [--via auto|http|browser]   # browser, API, login state
 ubereats search 烏弄 [--suggest]       # find stores
 ubereats store <url|uuid|b64id>       # open/ETA + full menu (alias: menu)
       [--available] [--grep 紅茶] [--mode PICKUP]
 ubereats item <store> <item name|uuid> # option groups (sweetness, ice, add-ons)
-ubereats raw getStoreV1 --body '{...}'
+ubereats raw getStoreV1 --body '{...}'    # get* endpoints only
 ```
 
 Every command takes `--json` → `{ok, data|error}`. Exit codes: 0 ok, 1 api, 3 auth, 4 net/blocked.

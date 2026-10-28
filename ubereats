@@ -5,14 +5,11 @@ ubereats - agent-native CLI for Uber Eats Taiwan (read-only).
 Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
 returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
 
-How it works, and why not plain HTTP
--------------------------------------
-www.ubereats.com sits behind bot protection: curl gets 403 and a fresh
-headless Chromium (e.g. Pomerado) gets a security-verification page. A real,
-already-trusted browser does not. So this CLI opens ONE background tab in the
-user's Edge on the Chrome DevTools Protocol port (default 127.0.0.1:9222),
-runs the same `/_p/api/*V1` JSON calls the web app makes via the page's own
-fetch(), and closes the tab. It never focuses or raises a window.
+How it works
+------------
+It calls the same `/_p/api/*V1` JSON endpoints the web app uses. The HTML
+pages are bot-walled (curl gets 403, headless Chromium such as Pomerado gets a
+verification page), the JSON API is not - see Transport below.
 
 Endpoints, measured 2026-10-28 (POST, JSON body, `x-csrf-token: x`):
   getStoreV1               {storeUuid, diningMode}       store + full catalog
@@ -527,30 +524,37 @@ def _text(v):
 
 def parse_store(d):
     items, seen, sections = [], set(), []
-    for sec_list in (d.get("catalogSectionsMap") or {}).values():
-        for sec in sec_list or []:
-            pl = (sec.get("payload") or {}).get("standardItemsPayload") or {}
-            title = _text(pl.get("title"))
-            rows = []
-            for it in pl.get("catalogItems") or []:
-                row = {
-                    "uuid": it.get("uuid"),
-                    "title": it.get("title"),
-                    "price": money(it.get("price")),
-                    "price_text": _text(it.get("priceTagline")),
-                    "description": it.get("itemDescription") or "",
-                    "sold_out": bool(it.get("isSoldOut")) or it.get("isAvailable") is False,
-                    "has_options": bool(it.get("hasCustomizations")),
-                    "section": title,
-                    "section_uuid": it.get("sectionUuid"),
-                    "subsection_uuid": it.get("subsectionUuid"),
-                    "image": it.get("imageUrl"),
-                    "duplicate": it.get("uuid") in seen,
-                }
+    # 精選商品-style carousels are HORIZONTAL_GRID and repeat items that also
+    # sit in their real (VERTICAL_GRID) section; keep the real-section copy.
+    secs = [s for sl in (d.get("catalogSectionsMap") or {}).values() for s in sl or []]
+    real = {it.get("uuid") for s in secs if s.get("type") != "HORIZONTAL_GRID"
+            for it in ((s.get("payload") or {}).get("standardItemsPayload") or {})
+            .get("catalogItems") or []}
+    for sec in secs:
+        featured = sec.get("type") == "HORIZONTAL_GRID"
+        pl = (sec.get("payload") or {}).get("standardItemsPayload") or {}
+        title = _text(pl.get("title"))
+        rows = []
+        for it in pl.get("catalogItems") or []:
+            row = {
+                "uuid": it.get("uuid"),
+                "title": it.get("title"),
+                "price": money(it.get("price")),
+                "price_text": _text(it.get("priceTagline")),
+                "description": it.get("itemDescription") or "",
+                "sold_out": bool(it.get("isSoldOut")) or it.get("isAvailable") is False,
+                "has_options": bool(it.get("hasCustomizations")),
+                "section": title,
+                "section_uuid": it.get("sectionUuid"),
+                "subsection_uuid": it.get("subsectionUuid"),
+                "image": it.get("imageUrl"),
+                "duplicate": it.get("uuid") in (real if featured else seen),
+            }
+            if not featured:
                 seen.add(it.get("uuid"))
-                rows.append(row)
-            sections.append({"title": title, "count": len(rows)})
-            items.extend(rows)
+            rows.append(row)
+        sections.append({"title": title, "count": len(rows)})
+        items.extend(rows)
     loc = d.get("location") or {}
     rating = d.get("rating") or {}
     return {
@@ -700,7 +704,7 @@ def cmd_item(args):
     sid = store_uuid(args.store)
     with Auto(args) as br:
         s = parse_store(br.api("getStoreV1", {"storeUuid": sid,
-                                              "diningMode": "DELIVERY"}))
+                                              "diningMode": args.mode}))
         q = args.item.lower()
         hit = next((i for i in s["items"] if i["uuid"] == args.item), None) or \
             next((i for i in s["items"] if (i["title"] or "").lower() == q), None) or \
@@ -714,7 +718,8 @@ def cmd_item(args):
     it = parse_item(d)
 
     def human():
-        out = [f"{it['title']}  ${it['price']:g}" + ("  SOLD OUT" if it["sold_out"] else ""),
+        price = f"  ${it['price']:g}" if it["price"] is not None else ""
+        out = [f"{it['title']}{price}" + ("  SOLD OUT" if it["sold_out"] else ""),
                it["description"], ""]
         for g in it["option_groups"]:
             need = ("required" if (g["min"] or 0) > 0 else "optional") + \
@@ -728,6 +733,10 @@ def cmd_item(args):
 
 
 def cmd_raw(args):
+    # ponytail: name-prefix allowlist; Uber's reads are get*V1, cart/checkout are not
+    if not args.endpoint.startswith("get"):
+        raise ApiError(f"raw only calls read endpoints (get*), not {args.endpoint!r}",
+                       {"usage": True})
     with Auto(args) as br:
         d = br.api(args.endpoint, json.loads(args.body or "{}"))
     return emit(ok(d), True)
@@ -813,10 +822,11 @@ def cmd_address(args):
         st.pop("address", None)
         save_state(st)
     elif args.action == "from-url":
-        q = urllib.parse.parse_qs(urllib.parse.urlparse(args.label).query).get("pl")
+        # not parse_qs: it turns base64 '+' into ' '
+        q = re.search(r"(?:^|&)pl=([^&]+)", urllib.parse.urlparse(args.label).query)
         if not q:
             raise ApiError("that URL has no pl= address parameter")
-        d = json.loads(urllib.parse.unquote(base64.b64decode(urllib.parse.unquote(q[0])).decode()))
+        d = json.loads(urllib.parse.unquote(base64.b64decode(urllib.parse.unquote(q.group(1))).decode()))
         st["address"] = {"label": d.get("address"), "lat": d["latitude"], "lng": d["longitude"],
                          "reference": d.get("reference", ""),
                          "referenceType": d.get("referenceType", "google_places")}
@@ -892,10 +902,11 @@ def build_parser():
                         help="one item with its option groups")
     it.add_argument("store", help="store URL, UUID, or the base64 id")
     it.add_argument("item", help="item UUID or (part of) its name")
+    it.add_argument("--mode", default="DELIVERY", choices=["DELIVERY", "PICKUP"])
     it.set_defaults(fn=cmd_item)
 
     r = sub.add_parser("raw", parents=[common],
-                       help="call any /_p/api endpoint (read-only use)")
+                       help="call a read-only /_p/api get* endpoint")
     r.add_argument("endpoint", help="e.g. getStoreV1")
     r.add_argument("--body", help="JSON body")
     r.set_defaults(fn=cmd_raw)
