@@ -1,0 +1,595 @@
+#!/usr/bin/env python3
+"""
+ubereats - agent-native CLI for Uber Eats Taiwan (read-only).
+
+Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
+returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
+
+How it works, and why not plain HTTP
+-------------------------------------
+www.ubereats.com sits behind bot protection: curl gets 403 and a fresh
+headless Chromium (e.g. Pomerado) gets a security-verification page. A real,
+already-trusted browser does not. So this CLI opens ONE background tab in the
+user's Edge on the Chrome DevTools Protocol port (default 127.0.0.1:9222),
+runs the same `/_p/api/*V1` JSON calls the web app makes via the page's own
+fetch(), and closes the tab. It never focuses or raises a window.
+
+Endpoints, measured 2026-10-28 (POST, JSON body, `x-csrf-token: x`):
+  getStoreV1               {storeUuid, diningMode}       store + full catalog
+  getMenuItemV1            {storeUuid, sectionUuid, subsectionUuid,
+                            menuItemUuid, itemRequestType:"ITEM"}  options
+  getSearchSuggestionsV1   {userQuery, vertical:"ALL"}   typeahead
+  getSearchFeedV1          {userQuery, ...}              search results
+  getUserV1 / getDraftOrdersByEaterUuidV1   need an Uber Eats login
+
+Store URLs carry the store UUID as url-safe base64 in the last path segment:
+  /store/<slug>/QovR6MpET0Wn9gcFKePWOA -> 428bd1e8-ca44-4f45-a7f6-070529e3d638
+
+Delivery address, ETA and "within range" come from the browser's Uber Eats
+session (its saved location), not from this CLI.
+
+Unofficial. Undocumented, private API - it can break without warning.
+Read-only by design: there is no add-to-cart or checkout command.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import socket
+import struct
+import sys
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+import uuid as uuidlib
+
+VERSION = "0.1.0"
+CDP = os.environ.get("UBEREATS_CDP", "http://127.0.0.1:9222")
+ORIGIN = "https://www.ubereats.com"
+LOCALE = os.environ.get("UBEREATS_LOCALE", "tw")
+
+EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+
+
+class Net(Exception):
+    pass
+
+
+class ApiError(Exception):
+    def __init__(self, msg, detail=None):
+        super().__init__(msg)
+        self.detail = detail
+
+
+# ---------------------------------------------------------------- envelope
+def ok(data):
+    return {"ok": True, "data": data}
+
+
+def err(msg, code=EX_ERR, **detail):
+    return {"ok": False, "error": {"message": msg, "code": code,
+                                   "detail": detail or None}}
+
+
+def emit(payload, as_json, human=None):
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    elif payload.get("ok"):
+        print(human() if callable(human) else
+              (human if human is not None else
+               json.dumps(payload["data"], ensure_ascii=False, indent=2)))
+    else:
+        print(payload["error"]["message"], file=sys.stderr)
+    return EX_OK if payload.get("ok") else payload["error"]["code"]
+
+
+def _w(text):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1
+               for c in str(text))
+
+
+def table(rows, headers):
+    if not rows:
+        return "(no rows)"
+    cols = list(zip(*([headers] + rows)))
+    widths = [max(_w(c) for c in col) for col in cols]
+    pad = lambda t, w: str(t) + " " * max(0, w - _w(t))  # noqa: E731
+    out = ["  ".join(pad(h, w) for h, w in zip(headers, widths)).rstrip(),
+           "  ".join("-" * w for w in widths)]
+    for r in rows:
+        out.append("  ".join(pad(c, w) for c, w in zip(r, widths)).rstrip())
+    return "\n".join(out)
+
+
+def clip(text, n):
+    text = (text or "").replace("\n", " ").strip()
+    return text if _w(text) <= n else text[: max(1, n // 2)] + "…"
+
+
+def money(minor):
+    if minor is None:
+        return None
+    return minor / 100
+
+
+# -------------------------------------------------------- CDP (stdlib ws)
+class WS:
+    def __init__(self, url, timeout=60):
+        if not url.startswith("ws://"):
+            raise Net(f"unsupported websocket url {url}")
+        hostport, path = url[5:].split("/", 1)
+        host, port = hostport.rsplit(":", 1)
+        try:
+            self.s = socket.create_connection((host, int(port)), timeout=timeout)
+        except OSError as e:
+            raise Net(f"cannot reach browser at {hostport}: {e}")
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.s.sendall((f"GET /{path} HTTP/1.1\r\nHost: {hostport}\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Key: {key}\r\n"
+                        "Sec-WebSocket-Version: 13\r\n\r\n").encode())
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = self.s.recv(4096)
+            if not chunk:
+                raise Net("websocket handshake closed")
+            buf += chunk
+        if b" 101 " not in buf.split(b"\r\n")[0]:
+            raise Net("websocket handshake refused (start Edge with "
+                      "--remote-allow-origins='*')")
+        self.rest = buf.split(b"\r\n\r\n", 1)[1]
+        self.n = 0
+
+    def _recv(self, n):
+        while len(self.rest) < n:
+            chunk = self.s.recv(65536)
+            if not chunk:
+                raise Net("browser closed the connection")
+            self.rest += chunk
+        out, self.rest = self.rest[:n], self.rest[n:]
+        return out
+
+    def _send(self, obj):
+        data = json.dumps(obj).encode()
+        hdr = bytearray([0x81])
+        n = len(data)
+        if n < 126:
+            hdr.append(0x80 | n)
+        elif n < 65536:
+            hdr.append(0x80 | 126)
+            hdr += struct.pack(">H", n)
+        else:
+            hdr.append(0x80 | 127)
+            hdr += struct.pack(">Q", n)
+        mask = os.urandom(4)
+        hdr += mask
+        self.s.sendall(bytes(hdr) + bytes(b ^ mask[i % 4]
+                                          for i, b in enumerate(data)))
+
+    def _recv_msg(self):
+        msg = b""
+        while True:
+            b0, b1 = self._recv(2)
+            n = b1 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._recv(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._recv(8))[0]
+            payload = self._recv(n)
+            op = b0 & 0x0F
+            if op == 8:
+                raise Net("browser closed the websocket")
+            if op in (9, 10):
+                continue
+            msg += payload
+            if b0 & 0x80:
+                return json.loads(msg)
+
+    def call(self, method, **params):
+        self.n += 1
+        i = self.n
+        self._send({"id": i, "method": method, "params": params})
+        while True:
+            m = self._recv_msg()
+            if m.get("id") == i:
+                if "error" in m:
+                    raise Net(f"{method}: {m['error'].get('message')}")
+                return m["result"]
+
+    def close(self):
+        try:
+            self.s.close()
+        except OSError:
+            pass
+
+
+def _http_json(path):
+    try:
+        with urllib.request.urlopen(CDP + path, timeout=5) as r:
+            return json.loads(r.read())
+    except OSError as e:
+        raise Net(f"no browser on {CDP} ({e}). start Edge with "
+                  "--remote-debugging-port=9222")
+
+
+class Browser:
+    """One background tab on ubereats.com, closed on exit. Never focused."""
+
+    def __init__(self, debug=False):
+        self.debug = debug
+        self.ver = _http_json("/json/version")
+        self.b = WS(self.ver["webSocketDebuggerUrl"])
+        t = self.b.call("Target.createTarget", url=ORIGIN + "/" + LOCALE,
+                        background=True)
+        self.tid = t["targetId"]
+        try:
+            tgt = next(x for x in _http_json("/json/list")
+                       if x["id"] == self.tid)
+            self.p = WS(tgt["webSocketDebuggerUrl"], timeout=90)
+            self._wait_ready()
+        except BaseException:
+            self.close()
+            raise
+
+    def _wait_ready(self, limit=25):
+        t0 = time.time()
+        while time.time() - t0 < limit:
+            r = self.eval("location.origin + '|' + document.readyState")
+            if r and r.startswith(ORIGIN) and r.endswith(("interactive", "complete")):
+                return
+            time.sleep(0.5)
+        raise Net("ubereats.com did not load in the background tab")
+
+    def eval(self, expr):
+        r = self.p.call("Runtime.evaluate", expression=expr,
+                        awaitPromise=True, returnByValue=True)
+        if r.get("exceptionDetails"):
+            raise ApiError("page script failed: " + str(
+                r["exceptionDetails"].get("exception", {}).get("description")
+                or r["exceptionDetails"].get("text")))
+        return r.get("result", {}).get("value")
+
+    def api(self, name, body):
+        js = ("fetch(%s,{method:'POST',credentials:'include',headers:"
+              "{'content-type':'application/json','x-csrf-token':'x'},body:%s})"
+              ".then(async r=>({http:r.status,text:await r.text()}))"
+              % (json.dumps(f"/_p/api/{name}?localeCode={LOCALE}"),
+                 json.dumps(json.dumps(body))))
+        if self.debug:
+            print(f"> POST {name} {json.dumps(body, ensure_ascii=False)}",
+                  file=sys.stderr)
+        r = self.eval(js)
+        if self.debug:
+            print(f"< {r['http']} {r['text'][:300]}", file=sys.stderr)
+        if r["http"] == 403 or r["text"].lstrip().startswith("<"):
+            raise Net(f"{name}: blocked by Uber Eats (HTTP {r['http']}). "
+                      "open ubereats.com once in that Edge and pass any check")
+        try:
+            j = json.loads(r["text"])
+        except ValueError:
+            raise ApiError(f"{name}: non-JSON reply (HTTP {r['http']})")
+        if j.get("status") != "success":
+            raise ApiError(f"{name}: {(j.get('data') or {}).get('message') or j.get('status')}",
+                           {"http": r["http"], "endpoint": name})
+        return j.get("data") or {}
+
+    def close(self):
+        try:
+            self.b.call("Target.closeTarget", targetId=self.tid)
+        except Exception:
+            pass
+        for w in (getattr(self, "p", None), getattr(self, "b", None)):
+            if w:
+                w.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+# --------------------------------------------------------------- helpers
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def store_uuid(ref):
+    """Accept a store UUID, a /store/<slug>/<b64> URL, or the bare b64 id."""
+    ref = ref.strip()
+    if UUID_RE.match(ref):
+        return ref.lower()
+    seg = ref
+    if "/" in ref:
+        path = urllib.parse.urlparse(ref).path.rstrip("/")
+        parts = path.split("/")
+        if "store" not in parts:
+            raise ApiError(f"not an Uber Eats store URL: {ref}")
+        seg = parts[parts.index("store") + 2] if len(parts) > parts.index("store") + 2 else parts[-1]
+    seg = urllib.parse.unquote(seg)
+    if UUID_RE.match(seg):
+        return seg.lower()
+    try:
+        raw = base64.urlsafe_b64decode(seg + "=" * (-len(seg) % 4))
+        return str(uuidlib.UUID(bytes=raw))
+    except (ValueError, TypeError):
+        raise ApiError(f"cannot read a store id from {ref!r}")
+
+
+def _text(v):
+    if isinstance(v, dict):
+        return v.get("text") or ""
+    return v or ""
+
+
+def parse_store(d):
+    items, seen, sections = [], set(), []
+    for sec_list in (d.get("catalogSectionsMap") or {}).values():
+        for sec in sec_list or []:
+            pl = (sec.get("payload") or {}).get("standardItemsPayload") or {}
+            title = _text(pl.get("title"))
+            rows = []
+            for it in pl.get("catalogItems") or []:
+                row = {
+                    "uuid": it.get("uuid"),
+                    "title": it.get("title"),
+                    "price": money(it.get("price")),
+                    "price_text": _text(it.get("priceTagline")),
+                    "description": it.get("itemDescription") or "",
+                    "sold_out": bool(it.get("isSoldOut")) or it.get("isAvailable") is False,
+                    "has_options": bool(it.get("hasCustomizations")),
+                    "section": title,
+                    "section_uuid": it.get("sectionUuid"),
+                    "subsection_uuid": it.get("subsectionUuid"),
+                    "image": it.get("imageUrl"),
+                    "duplicate": it.get("uuid") in seen,
+                }
+                seen.add(it.get("uuid"))
+                rows.append(row)
+            sections.append({"title": title, "count": len(rows)})
+            items.extend(rows)
+    loc = d.get("location") or {}
+    rating = d.get("rating") or {}
+    return {
+        "uuid": d.get("uuid"),
+        "title": d.get("title"),
+        "url": f"{ORIGIN}/{LOCALE}/store/{d.get('slug')}/"
+               + base64.urlsafe_b64encode(uuidlib.UUID(d["uuid"]).bytes).decode().rstrip("=")
+        if d.get("uuid") and d.get("slug") else None,
+        "is_open": d.get("isOpen"),
+        "is_orderable": d.get("isOrderable"),
+        "closed_message": d.get("closedMessage") or "",
+        "eta": _text(d.get("etaRange")),
+        "within_delivery_range": d.get("isWithinDeliveryRange"),
+        "rating": rating.get("ratingValue"),
+        "rating_count": _text(rating.get("reviewCount")) or rating.get("reviewCount"),
+        "address": loc.get("address") or loc.get("streetAddress"),
+        "currency": d.get("currencyCode"),
+        "sections": sections,
+        "items": items,
+    }
+
+
+def parse_item(d):
+    groups = []
+    for g in d.get("customizationsList") or []:
+        groups.append({
+            "uuid": g.get("uuid"),
+            "title": g.get("title"),
+            "min": g.get("minPermitted"),
+            "max": g.get("maxPermitted"),
+            "options": [{"uuid": o.get("uuid"), "title": o.get("title"),
+                         "price": money(o.get("price")),
+                         "sold_out": bool(o.get("isSoldOut"))}
+                        for o in g.get("options") or []],
+        })
+    return {"uuid": d.get("uuid"), "title": d.get("title"),
+            "price": money(d.get("price")),
+            "description": d.get("itemDescription") or "",
+            "sold_out": bool(d.get("isSoldOut")), "option_groups": groups}
+
+
+SEARCH_BODY = {"date": "", "startTime": 0, "endTime": 0, "carouselId": "",
+               "sortAndFilters": [], "marketingFeedType": "",
+               "billboardUuid": "", "feedProvider": "", "promotionUuid": "",
+               "targetingStoreTag": "", "venueUUID": "",
+               "selectedSectionUUID": "", "favorites": "", "vertical": "",
+               "searchSource": "SEARCH_SUGGESTION",
+               "displayType": "SEARCH_RESULTS", "keyName": ""}
+
+
+def parse_search(d):
+    out = []
+    for f in d.get("feedItems") or []:
+        s = f.get("store")
+        if not s:
+            continue
+        meta = [_text(m) for m in s.get("meta") or []]
+        rating = s.get("rating") or {}
+        uid = s.get("storeUuid")
+        out.append({"uuid": uid, "title": _text(s.get("title")),
+                    "meta": [m for m in meta if m],
+                    "rating": _text(rating) or None,
+                    "url": f"{ORIGIN}/{LOCALE}/store/x/" +
+                    base64.urlsafe_b64encode(uuidlib.UUID(uid).bytes).decode().rstrip("=")
+                    if uid else None})
+    return out
+
+
+# --------------------------------------------------------------- commands
+def cmd_doctor(args):
+    checks = []
+    try:
+        ver = _http_json("/json/version")
+        checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')}"])
+    except Net as e:
+        checks.append(["cdp", "FAIL", str(e)])
+        return emit(err("browser not reachable", EX_NET, checks=checks),
+                    args.json, None)
+    try:
+        with Browser(args.debug) as br:
+            sugg = br.api("getSearchSuggestionsV1",
+                          {"userQuery": "pizza", "vertical": "ALL"})
+            checks.append(["api", "ok", f"{len(sugg or [])} suggestions"])
+            try:
+                u = br.api("getUserV1", {})
+                checks.append(["login", "ok", u.get("firstName") or "signed in"])
+            except ApiError:
+                checks.append(["login", "no", "not signed in (read-only works)"])
+    except (Net, ApiError) as e:
+        checks.append(["api", "FAIL", str(e)])
+        return emit(err(str(e), EX_NET, checks=checks), args.json)
+    return emit(ok({"checks": checks}), args.json,
+                lambda: table(checks, ["check", "state", "detail"]))
+
+
+def cmd_search(args):
+    with Browser(args.debug) as br:
+        if args.suggest:
+            d = br.api("getSearchSuggestionsV1",
+                       {"userQuery": args.query, "vertical": "ALL"})
+            rows = [{"type": x.get("type"),
+                     "title": (x.get("store") or {}).get("title") or x.get("title"),
+                     "uuid": (x.get("store") or {}).get("uuid")} for x in d or []]
+            return emit(ok(rows), args.json, lambda: table(
+                [[r["type"], r["title"] or "", r["uuid"] or ""] for r in rows],
+                ["type", "title", "uuid"]))
+        d = br.api("getSearchFeedV1", dict(SEARCH_BODY, userQuery=args.query))
+    rows = parse_search(d)[: args.limit]
+    return emit(ok(rows), args.json, lambda: table(
+        [[i + 1, clip(r["title"], 40), clip(" · ".join(r["meta"]), 30), r["uuid"]]
+         for i, r in enumerate(rows)], ["#", "store", "info", "uuid"]))
+
+
+def cmd_store(args):
+    sid = store_uuid(args.store)
+    with Browser(args.debug) as br:
+        s = parse_store(br.api("getStoreV1", {"storeUuid": sid,
+                                              "diningMode": args.mode}))
+    if not args.all:
+        s["items"] = [i for i in s["items"] if not i["duplicate"]]
+    if args.available:
+        s["items"] = [i for i in s["items"] if not i["sold_out"]]
+    if args.grep:
+        g = args.grep.lower()
+        s["items"] = [i for i in s["items"]
+                      if g in (i["title"] or "").lower() or g in i["description"].lower()]
+
+    def human():
+        head = (f"{s['title']}  ({'open' if s['is_open'] else 'CLOSED'}"
+                f"{', ' + s['eta'] if s['eta'] else ''})\n"
+                f"{s['url'] or ''}\n")
+        if s["closed_message"]:
+            head += s["closed_message"] + "\n"
+        rows = [[clip(i["section"], 16), clip(i["title"], 34),
+                 i["price_text"] or i["price"], "SOLD OUT" if i["sold_out"] else "",
+                 "+opt" if i["has_options"] else ""] for i in s["items"]]
+        return head + "\n" + table(rows, ["section", "item", "price", "", ""])
+    return emit(ok(s), args.json, human)
+
+
+def cmd_item(args):
+    sid = store_uuid(args.store)
+    with Browser(args.debug) as br:
+        s = parse_store(br.api("getStoreV1", {"storeUuid": sid,
+                                              "diningMode": "DELIVERY"}))
+        q = args.item.lower()
+        hit = next((i for i in s["items"] if i["uuid"] == args.item), None) or \
+            next((i for i in s["items"] if (i["title"] or "").lower() == q), None) or \
+            next((i for i in s["items"] if q in (i["title"] or "").lower()), None)
+        if not hit:
+            raise ApiError(f"no item matching {args.item!r} in {s['title']}")
+        d = br.api("getMenuItemV1", {"itemRequestType": "ITEM", "storeUuid": sid,
+                                     "sectionUuid": hit["section_uuid"],
+                                     "subsectionUuid": hit["subsection_uuid"],
+                                     "menuItemUuid": hit["uuid"]})
+    it = parse_item(d)
+
+    def human():
+        out = [f"{it['title']}  ${it['price']:g}" + ("  SOLD OUT" if it["sold_out"] else ""),
+               it["description"], ""]
+        for g in it["option_groups"]:
+            need = ("required" if (g["min"] or 0) > 0 else "optional") + \
+                   f", pick {g['min']}-{g['max']}"
+            out.append(f"[{g['title']}] ({need})")
+            for o in g["options"]:
+                extra = f" +${o['price']:g}" if o["price"] else ""
+                out.append(f"  - {o['title']}{extra}" + (" (sold out)" if o["sold_out"] else ""))
+        return "\n".join(out)
+    return emit(ok(it), args.json, human)
+
+
+def cmd_raw(args):
+    with Browser(args.debug) as br:
+        d = br.api(args.endpoint, json.loads(args.body or "{}"))
+    return emit(ok(d), True)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="ubereats",
+                                description="Uber Eats Taiwan from the shell "
+                                            "(read-only, via your Edge on CDP).")
+    p.add_argument("--version", action="version", version=VERSION)
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true",
+                        help="stable {ok, data|error} envelope")
+    common.add_argument("--debug", action="store_true",
+                        help="dump API calls to stderr")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("doctor", parents=[common],
+                   help="browser, API reachability, login state"
+                   ).set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("search", parents=[common], help="find stores")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=15)
+    s.add_argument("--suggest", action="store_true",
+                   help="typeahead suggestions instead of full results")
+    s.set_defaults(fn=cmd_search)
+
+    st = sub.add_parser("store", aliases=["menu"], parents=[common],
+                        help="store status, ETA and full menu")
+    st.add_argument("store", help="store URL, UUID, or the base64 id")
+    st.add_argument("--mode", default="DELIVERY",
+                    choices=["DELIVERY", "PICKUP"])
+    st.add_argument("--available", action="store_true",
+                    help="hide sold-out items")
+    st.add_argument("--grep", help="filter items by name/description")
+    st.add_argument("--all", action="store_true",
+                    help="keep items repeated in featured sections")
+    st.set_defaults(fn=cmd_store)
+
+    it = sub.add_parser("item", parents=[common],
+                        help="one item with its option groups")
+    it.add_argument("store", help="store URL, UUID, or the base64 id")
+    it.add_argument("item", help="item UUID or (part of) its name")
+    it.set_defaults(fn=cmd_item)
+
+    r = sub.add_parser("raw", parents=[common],
+                       help="call any /_p/api endpoint (read-only use)")
+    r.add_argument("endpoint", help="e.g. getStoreV1")
+    r.add_argument("--body", help="JSON body")
+    r.set_defaults(fn=cmd_raw)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.fn(args)
+    except Net as e:
+        return emit(err(str(e), EX_NET), args.json)
+    except ApiError as e:
+        return emit(err(str(e), EX_ERR, **(e.detail or {})), args.json)
+    except BrokenPipeError:
+        return EX_OK
+    except KeyboardInterrupt:
+        return EX_ERR
+
+
+if __name__ == "__main__":
+    sys.exit(main())
