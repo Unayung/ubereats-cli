@@ -25,8 +25,23 @@ Endpoints, measured 2026-10-28 (POST, JSON body, `x-csrf-token: x`):
 Store URLs carry the store UUID as url-safe base64 in the last path segment:
   /store/<slug>/QovR6MpET0Wn9gcFKePWOA -> 428bd1e8-ca44-4f45-a7f6-070529e3d638
 
-Delivery address, ETA and "within range" come from the browser's Uber Eats
-session (its saved location), not from this CLI.
+Transport (measured 2026-10-28): the /_p/api JSON endpoints answer plain
+HTTPS with a browser User-Agent, Origin and `x-csrf-token: x` - only the HTML
+store pages are bot-walled. So the default transport is direct HTTP (portable,
+no browser). `--via browser` (or auto-fallback on a 403/HTML reply) runs the
+same call inside a background tab of an Edge/Chrome on CDP.
+
+Delivery address: the web app keeps it in the `uev2.loc` cookie (JSON). The
+CLI sends that cookie from `ubereats address set`, which changes ETA, range
+and search ranking. Without it Uber Eats guesses from your IP.
+
+Login (Uber uses phone/email one-time codes plus bot checks, so no password
+login here): sign in once in any browser, then either
+  ubereats login --from-browser [--cdp http://127.0.0.1:9222]
+  ubereats login --cookie-stdin     (paste DevTools' Cookie request header)
+The cookie is verified with getUserV1 before it is saved to
+~/.config/ubereats/state.json (0600), or to the OS keyring with --keyring
+(macOS `security`, Linux `secret-tool`). UBEREATS_COOKIE overrides both.
 
 Unofficial. Undocumented, private API - it can break without warning.
 Read-only by design: there is no add-to-cart or checkout command.
@@ -40,6 +55,8 @@ import os
 import re
 import socket
 import struct
+import subprocess
+import urllib.error
 import sys
 import time
 import unicodedata
@@ -47,15 +64,28 @@ import urllib.parse
 import urllib.request
 import uuid as uuidlib
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CDP = os.environ.get("UBEREATS_CDP", "http://127.0.0.1:9222")
 ORIGIN = "https://www.ubereats.com"
 LOCALE = os.environ.get("UBEREATS_LOCALE", "tw")
 
 EX_OK, EX_ERR, EX_USAGE, EX_AUTH, EX_NET = 0, 1, 2, 3, 4
+UA = os.environ.get("UBEREATS_UA", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36")
+STATE_DIR = os.path.expanduser(os.environ.get("UBEREATS_HOME", "~/.config/ubereats"))
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+KEYRING_SERVICE = "ubereats-cli"
 
 
 class Net(Exception):
+    pass
+
+
+class Blocked(Net):
+    pass
+
+
+class Auth(Exception):
     pass
 
 
@@ -219,7 +249,10 @@ def _http_json(path):
 class Browser:
     """One background tab on ubereats.com, closed on exit. Never focused."""
 
-    def __init__(self, debug=False):
+    def __init__(self, debug=False, cdp=None):
+        global CDP
+        if cdp:
+            CDP = cdp
         self.debug = debug
         self.ver = _http_json("/json/version")
         self.b = WS(self.ver["webSocketDebuggerUrl"])
@@ -265,17 +298,10 @@ class Browser:
         r = self.eval(js)
         if self.debug:
             print(f"< {r['http']} {r['text'][:300]}", file=sys.stderr)
-        if r["http"] == 403 or r["text"].lstrip().startswith("<"):
-            raise Net(f"{name}: blocked by Uber Eats (HTTP {r['http']}). "
-                      "open ubereats.com once in that Edge and pass any check")
-        try:
-            j = json.loads(r["text"])
-        except ValueError:
-            raise ApiError(f"{name}: non-JSON reply (HTTP {r['http']})")
-        if j.get("status") != "success":
-            raise ApiError(f"{name}: {(j.get('data') or {}).get('message') or j.get('status')}",
-                           {"http": r["http"], "endpoint": name})
-        return j.get("data") or {}
+        return parse_reply(name, r["http"], r["text"])
+
+    def cookies(self):
+        return self.p.call("Network.getCookies", urls=[ORIGIN])["cookies"]
 
     def close(self):
         try:
@@ -291,6 +317,180 @@ class Browser:
 
     def __exit__(self, *a):
         self.close()
+
+
+def parse_reply(name, http, text):
+    if http == 403 or text.lstrip().startswith("<"):
+        raise Blocked(f"{name}: blocked by Uber Eats (HTTP {http})")
+    try:
+        j = json.loads(text)
+    except ValueError:
+        raise ApiError(f"{name}: non-JSON reply (HTTP {http})")
+    if j.get("status") != "success":
+        msg = (j.get("data") or {}).get("message") or j.get("status")
+        if http in (401,) or "auth" in str(msg).lower():
+            raise Auth(f"{name}: not signed in ({msg}) - run `ubereats login`")
+        raise ApiError(f"{name}: {msg}", {"http": http, "endpoint": name})
+    return j.get("data") or {}
+
+
+# ------------------------------------------------------------------ state
+def _keyring(op, secret=None):
+    acct = "default"
+    try:
+        if sys.platform == "darwin":
+            cmd = {"set": ["security", "add-generic-password", "-U", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w", secret],
+                   "get": ["security", "find-generic-password", "-a", acct,
+                           "-s", KEYRING_SERVICE, "-w"],
+                   "del": ["security", "delete-generic-password", "-a", acct,
+                           "-s", KEYRING_SERVICE]}[op]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+        else:
+            base = ["service", KEYRING_SERVICE, "account", acct]
+            cmd = {"set": ["secret-tool", "store", "--label=ubereats-cli"] + base,
+                   "get": ["secret-tool", "lookup"] + base,
+                   "del": ["secret-tool", "clear"] + base}[op]
+            r = subprocess.run(cmd, input=secret if op == "set" else None,
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        raise Auth("no keyring tool (macOS `security` / Linux `secret-tool`)")
+    if op == "get":
+        return r.stdout.strip() if r.returncode == 0 else None
+    if op == "set" and r.returncode != 0:
+        raise Auth("keyring write failed: " + r.stderr.strip())
+    return True
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            st = json.load(f)
+    except FileNotFoundError:
+        st = {}
+    except (OSError, ValueError) as e:
+        raise ApiError(f"state file unreadable: {e}")
+    if os.environ.get("UBEREATS_COOKIE"):
+        st["cookie"], st["source"] = os.environ["UBEREATS_COOKIE"].strip(), "env"
+    elif st.get("cookie_in_keyring"):
+        st["cookie"], st["source"] = _keyring("get"), "keyring"
+    elif st.get("cookie"):
+        st["source"] = "file"
+    return st
+
+
+def save_state(st):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    out = {k: v for k, v in st.items() if k != "source"}
+    if out.get("cookie_in_keyring"):
+        out.pop("cookie", None)
+    tmp = STATE_FILE + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STATE_FILE)
+
+
+def jwt_exp(cookie):
+    m = re.search(r"(?:^|;\s*)jwt-session=([^;]+)", cookie or "")
+    if not m:
+        return None
+    try:
+        part = m.group(1).split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))).get("exp")
+    except (IndexError, ValueError):
+        return None
+
+
+def loc_cookie(addr):
+    loc = {"address": {"address1": addr["label"], "address2": "", "aptOrSuite": "",
+                       "eaterFormattedAddress": "", "subtitle": "",
+                       "title": addr["label"], "uuid": ""},
+           "latitude": addr["lat"], "longitude": addr["lng"],
+           "reference": addr.get("reference", ""),
+           "referenceType": addr.get("referenceType", "google_places"),
+           "type": addr.get("referenceType", "google_places")}
+    return "uev2.loc=" + urllib.parse.quote(json.dumps(loc, ensure_ascii=False))
+
+
+def cookie_header(st):
+    parts = []
+    if st.get("cookie"):
+        parts.append(re.sub(r"(?:^|;\s*)uev2\.loc=[^;]*", "", st["cookie"]).strip("; "))
+    if st.get("address"):
+        parts.append(loc_cookie(st["address"]))
+    return "; ".join(p for p in parts if p)
+
+
+# -------------------------------------------------------------- transport
+class Http:
+    """Direct HTTPS to the JSON API. Portable: no browser needed."""
+
+    def __init__(self, st, debug=False):
+        self.st, self.debug = st, debug
+
+    def api(self, name, body):
+        h = {"content-type": "application/json", "x-csrf-token": "x",
+             "User-Agent": UA, "Origin": ORIGIN, "Referer": f"{ORIGIN}/{LOCALE}",
+             "Accept": "application/json"}
+        ck = cookie_header(self.st)
+        if ck:
+            h["Cookie"] = ck
+        if self.debug:
+            print(f"> POST {name} {json.dumps(body, ensure_ascii=False)}", file=sys.stderr)
+        req = urllib.request.Request(f"{ORIGIN}/_p/api/{name}?localeCode={LOCALE}",
+                                     data=json.dumps(body).encode(), headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                code, text = r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            code, text = e.code, e.read().decode("utf-8", "replace")
+        except OSError as e:
+            raise Net(f"{name}: {e}")
+        if self.debug:
+            print(f"< {code} {text[:300]}", file=sys.stderr)
+        return parse_reply(name, code, text)
+
+    def close(self):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        pass
+
+
+class Auto:
+    """HTTP first; on a bot wall, retry that call in a CDP background tab."""
+
+    def __init__(self, args):
+        self.args, self.st = args, load_state()
+        self.http, self.br = Http(self.st, args.debug), None
+        if self.st.get("cookie") and jwt_exp(self.st["cookie"]) and \
+                jwt_exp(self.st["cookie"]) < time.time():
+            print("warning: saved Uber Eats session expired - run `ubereats login`",
+                  file=sys.stderr)
+
+    def api(self, name, body):
+        if self.args.via != "browser":
+            try:
+                return self.http.api(name, body)
+            except Blocked:
+                if self.args.via == "http":
+                    raise
+                print(f"note: {name} blocked over HTTP, retrying via browser",
+                      file=sys.stderr)
+        if not self.br:
+            self.br = Browser(self.args.debug)
+        return self.br.api(name, body)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        if self.br:
+            self.br.close()
 
 
 # --------------------------------------------------------------- helpers
@@ -422,32 +622,37 @@ def parse_search(d):
 # --------------------------------------------------------------- commands
 def cmd_doctor(args):
     checks = []
+    st = load_state()
+    checks.append(["state", "ok" if os.path.exists(STATE_FILE) else "-", STATE_FILE])
+    try:
+        Http(st, args.debug).api("getSearchSuggestionsV1", {"userQuery": "pizza", "vertical": "ALL"})
+        checks.append(["http", "ok", "direct API reachable (no browser needed)"])
+    except (Net, ApiError) as e:
+        checks.append(["http", "FAIL", str(e)])
     try:
         ver = _http_json("/json/version")
-        checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')}"])
-    except Net as e:
-        checks.append(["cdp", "FAIL", str(e)])
-        return emit(err("browser not reachable", EX_NET, checks=checks),
-                    args.json, None)
-    try:
-        with Browser(args.debug) as br:
-            sugg = br.api("getSearchSuggestionsV1",
-                          {"userQuery": "pizza", "vertical": "ALL"})
-            checks.append(["api", "ok", f"{len(sugg or [])} suggestions"])
-            try:
-                u = br.api("getUserV1", {})
-                checks.append(["login", "ok", u.get("firstName") or "signed in"])
-            except ApiError:
-                checks.append(["login", "no", "not signed in (read-only works)"])
-    except (Net, ApiError) as e:
-        checks.append(["api", "FAIL", str(e)])
-        return emit(err(str(e), EX_NET, checks=checks), args.json)
-    return emit(ok({"checks": checks}), args.json,
-                lambda: table(checks, ["check", "state", "detail"]))
+        checks.append(["cdp", "ok", f"{CDP} {ver.get('Browser')} (fallback)"])
+    except Net:
+        checks.append(["cdp", "-", f"no browser on {CDP} (only needed for fallback / login --from-browser)"])
+    a = st.get("address")
+    checks.append(["address", "ok" if a else "-", a["label"] if a else "unset: Uber Eats guesses from IP"])
+    if st.get("cookie"):
+        try:
+            u = Http(st, args.debug).api("getUserV1", {})
+            checks.append(["login", "ok", f"{u.get('firstName') or ''} via {st.get('source')}"])
+        except (Auth, ApiError, Net) as e:
+            checks.append(["login", "FAIL", f"saved session rejected: {e}"])
+    else:
+        checks.append(["login", "-", "not signed in (read-only works)"])
+    bad = any(c[1] == "FAIL" for c in checks)
+    payload = err("doctor found problems", EX_NET, checks=checks) if bad else ok({"checks": checks})
+    if bad and not args.json:
+        print(table(checks, ["check", "state", "detail"]))
+    return emit(payload, args.json, lambda: table(checks, ["check", "state", "detail"]))
 
 
 def cmd_search(args):
-    with Browser(args.debug) as br:
+    with Auto(args) as br:
         if args.suggest:
             d = br.api("getSearchSuggestionsV1",
                        {"userQuery": args.query, "vertical": "ALL"})
@@ -466,7 +671,7 @@ def cmd_search(args):
 
 def cmd_store(args):
     sid = store_uuid(args.store)
-    with Browser(args.debug) as br:
+    with Auto(args) as br:
         s = parse_store(br.api("getStoreV1", {"storeUuid": sid,
                                               "diningMode": args.mode}))
     if not args.all:
@@ -493,7 +698,7 @@ def cmd_store(args):
 
 def cmd_item(args):
     sid = store_uuid(args.store)
-    with Browser(args.debug) as br:
+    with Auto(args) as br:
         s = parse_store(br.api("getStoreV1", {"storeUuid": sid,
                                               "diningMode": "DELIVERY"}))
         q = args.item.lower()
@@ -523,26 +728,146 @@ def cmd_item(args):
 
 
 def cmd_raw(args):
-    with Browser(args.debug) as br:
+    with Auto(args) as br:
         d = br.api(args.endpoint, json.loads(args.body or "{}"))
     return emit(ok(d), True)
+
+
+def _verify(cookie, debug):
+    try:
+        u = Http({"cookie": cookie}, debug).api("getUserV1", {})
+    except (Auth, ApiError) as e:
+        raise Auth(f"that session is not signed in to Uber Eats ({e}). "
+                   "sign in on ubereats.com first, then copy the session again")
+    if not u.get("uuid"):
+        raise Auth("getUserV1 returned no user - not signed in")
+    return u
+
+
+def cmd_login(args):
+    if args.from_browser:
+        with Browser(args.debug, args.cdp) as br:
+            cks = br.cookies()
+        cookie = "; ".join(f"{c['name']}={c['value']}" for c in cks
+                           if c["name"] != "uev2.loc")
+        src = f"browser {args.cdp or CDP}"
+    elif args.cookie_stdin:
+        cookie = sys.stdin.readline().strip()
+        if cookie.lower().startswith("cookie:"):
+            cookie = cookie.split(":", 1)[1].strip()
+        src = "stdin"
+    else:
+        raise ApiError("pick --from-browser or --cookie-stdin", {"usage": True})
+    if not cookie:
+        raise Auth("empty cookie")
+    u = _verify(cookie, args.debug)
+    st = load_state()
+    st.pop("source", None)
+    st.update(cookie=cookie, cookie_in_keyring=bool(args.keyring),
+              user={"uuid": u.get("uuid"), "first_name": u.get("firstName")},
+              logged_in_at=int(time.time()), exp=jwt_exp(cookie), login_source=src)
+    if args.keyring:
+        _keyring("set", cookie)
+    save_state(st)
+    out = {"user": st["user"], "stored": "keyring" if args.keyring else STATE_FILE,
+           "expires": st["exp"]}
+    return emit(ok(out), args.json,
+                lambda: f"signed in as {u.get('firstName') or u.get('uuid')}; "
+                        f"session saved to {out['stored']}")
+
+
+def cmd_logout(args):
+    st = load_state()
+    if st.get("cookie_in_keyring"):
+        _keyring("del")
+    for k in ("cookie", "cookie_in_keyring", "user", "logged_in_at", "exp",
+              "login_source", "source"):
+        st.pop(k, None)
+    save_state(st)
+    return emit(ok({"logged_out": True}), args.json, "session removed")
+
+
+def cmd_whoami(args):
+    st = load_state()
+    if not st.get("cookie"):
+        raise Auth("not signed in - run `ubereats login`")
+    u = _verify(st["cookie"], args.debug)
+    out = {"uuid": u.get("uuid"), "first_name": u.get("firstName"),
+           "last_name": u.get("lastName"), "source": st.get("source"),
+           "expires": st.get("exp")}
+    return emit(ok(out), args.json, lambda: f"{out['first_name'] or ''} {out['last_name'] or ''} "
+                                            f"({out['uuid']}) via {out['source']}")
+
+
+def cmd_address(args):
+    st = load_state()
+    st.pop("source", None)
+    if args.action == "set":
+        if args.lat is None or args.lng is None:
+            raise ApiError("address set needs --lat and --lng (copy from the store URL's pl= "
+                           "parameter or Google Maps)")
+        st["address"] = {"label": args.label, "lat": args.lat, "lng": args.lng,
+                         "reference": args.place_id or "", "referenceType": "google_places"}
+        save_state(st)
+    elif args.action == "clear":
+        st.pop("address", None)
+        save_state(st)
+    elif args.action == "from-url":
+        q = urllib.parse.parse_qs(urllib.parse.urlparse(args.label).query).get("pl")
+        if not q:
+            raise ApiError("that URL has no pl= address parameter")
+        d = json.loads(urllib.parse.unquote(base64.b64decode(urllib.parse.unquote(q[0])).decode()))
+        st["address"] = {"label": d.get("address"), "lat": d["latitude"], "lng": d["longitude"],
+                         "reference": d.get("reference", ""),
+                         "referenceType": d.get("referenceType", "google_places")}
+        save_state(st)
+    a = st.get("address")
+    return emit(ok(a), args.json, lambda: f"{a['label']} ({a['lat']}, {a['lng']})" if a else "(no address)")
 
 
 def build_parser():
     p = argparse.ArgumentParser(prog="ubereats",
                                 description="Uber Eats Taiwan from the shell "
-                                            "(read-only, via your Edge on CDP).")
+                                            "(read-only).")
     p.add_argument("--version", action="version", version=VERSION)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true",
                         help="stable {ok, data|error} envelope")
     common.add_argument("--debug", action="store_true",
                         help="dump API calls to stderr")
+    common.add_argument("--via", choices=["auto", "http", "browser"], default="auto",
+                        help="transport: direct HTTP, CDP browser tab, or HTTP with "
+                             "browser fallback (default)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("doctor", parents=[common],
                    help="browser, API reachability, login state"
                    ).set_defaults(fn=cmd_doctor)
+
+    lg = sub.add_parser("login", parents=[common],
+                        help="save a signed-in Uber Eats session")
+    g = lg.add_mutually_exclusive_group(required=True)
+    g.add_argument("--from-browser", action="store_true",
+                   help="copy the session from a CDP browser where you signed in")
+    g.add_argument("--cookie-stdin", action="store_true",
+                   help="read a DevTools Cookie request header from stdin")
+    lg.add_argument("--cdp", help=f"CDP endpoint (default {CDP})")
+    lg.add_argument("--keyring", action="store_true",
+                    help="store the cookie in the OS keyring, not the state file")
+    lg.set_defaults(fn=cmd_login)
+    sub.add_parser("logout", parents=[common], help="forget the saved session"
+                   ).set_defaults(fn=cmd_logout)
+    sub.add_parser("whoami", parents=[common], help="who the saved session is"
+                   ).set_defaults(fn=cmd_whoami)
+    ad = sub.add_parser("address", parents=[common], help="delivery address")
+    ad.add_argument("action", nargs="?", default="show",
+                    choices=["show", "set", "clear", "from-url"])
+    ad.add_argument("label", nargs="?", default="",
+                    help="address text (set) or a store URL with pl= (from-url)")
+    ad.add_argument("--lat", type=float)
+    ad.add_argument("--lng", type=float)
+    ad.add_argument("--place-id")
+    ad.set_defaults(fn=cmd_address)
 
     s = sub.add_parser("search", parents=[common], help="find stores")
     s.add_argument("query")
@@ -581,6 +906,8 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         return args.fn(args)
+    except Auth as e:
+        return emit(err(str(e), EX_AUTH), args.json)
     except Net as e:
         return emit(err(str(e), EX_NET), args.json)
     except ApiError as e:
