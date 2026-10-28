@@ -14,7 +14,9 @@ source for `login --from-browser`. Run `ubereats doctor` first on a new machine.
 
 - `ubereats store <url> --json` — `is_open`, `eta`, `items[]` (title, price TWD, sold_out, has_options, section)
 - `ubereats item <url> <name>` — required/optional option groups with prices
-- `ubereats search <q>` — stores near the Edge session's saved address
+- `ubereats search <q>` — stores near the saved `address` (else IP guess)
+- `--via http|browser` forces a transport; default HTTP with CDP fallback on 403/HTML
+- Session: `~/.config/ubereats/state.json` (0600) or `--keyring`; `UBEREATS_COOKIE` overrides; `whoami` / `logout`
 - Store URL last segment is the store UUID in url-safe base64.
 
 Pitfalls: without a saved session getUserV1 / draft orders fail (exit 3). Without an
