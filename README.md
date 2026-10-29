@@ -26,6 +26,7 @@ An expired `jwt-session` prints a warning; calls that need login then fail with 
 
 ```
 ubereats address from-url '<store URL containing pl=...>'
+ubereats address set '台北市松山區民生東路三段128號'   # looked up via Uber Eats; prints the match
 ubereats address set '民生東路三段128號' --lat 25.0576 --lng 121.5460
 ```
 Sent as the `uev2.loc` cookie; changes ETA, delivery range and search ranking.
@@ -39,6 +40,25 @@ ubereats item <store> <item name|uuid> # option groups (sweetness, ice, add-ons)
 ubereats raw getStoreV1 --body '{...}'    # get* endpoints only
 ```
 
+## Group orders (團購)
+
+Someone shares `https://eats.uber.com/group-orders/<uuid>/join`:
+
+```
+ubereats group peek <link>             # store, deliver-to, who pays, joined?; members + items once joined
+ubereats group join <link> --yes       # [--nickname NAME]
+ubereats group add <link> 一品紅茶 --opt 熱 --opt 小 --opt 微糖 [--opt 椰果] [--qty 2] [--note ..] --yes
+ubereats group rm <link> 一品紅茶 --yes
+```
+
+Without `--yes`, join/add/rm only print what they would do. `--opt` matches an option title
+exactly if that title exists anywhere in the item, else by substring; nested options
+(size under temperature) work; unset required groups take the store's default. `add` refuses
+groups that split the bill (`you_pay`) unless `--i-pay`. `peek` reads `getJoinGroupOrderMetaV1`,
+which also answers for closed or discarded groups, so `joined, UNORDERED` is the only proof a
+group is still open.
+
 Every command takes `--json` → `{ok, data|error}`. Exit codes: 0 ok, 1 api, 3 auth, 4 net/blocked.
 
-No cart / checkout commands by design. Unofficial private API — may break anytime.
+No checkout by design: the only writes are joining a group order and adding/removing your own
+items in it. The group host places and pays for the order. Unofficial private API — may break anytime.

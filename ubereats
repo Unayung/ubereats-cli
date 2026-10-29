@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ubereats - agent-native CLI for Uber Eats Taiwan (read-only).
+ubereats - agent-native CLI for Uber Eats Taiwan (no checkout).
 
 Zero dependencies (Python 3.8+ stdlib). Every command supports --json and
 returns the {ok, data|error} envelope used by the other ~/Projects CLIs.
@@ -41,7 +41,8 @@ The cookie is verified with getUserV1 before it is saved to
 (macOS `security`, Linux `secret-tool`). UBEREATS_COOKIE overrides both.
 
 Unofficial. Undocumented, private API - it can break without warning.
-Read-only by design: there is no add-to-cart or checkout command.
+No checkout by design. The only writes are group orders: join one and
+add/remove your own items (`group join|add|rm`, each needs --yes).
 """
 from __future__ import annotations
 
@@ -523,19 +524,22 @@ def _text(v):
 
 
 def parse_store(d):
-    items, seen, sections = [], set(), []
-    # 精選商品-style carousels are HORIZONTAL_GRID and repeat items that also
-    # sit in their real (VERTICAL_GRID) section; keep the real-section copy.
+    items, sections = [], []
     secs = [s for sl in (d.get("catalogSectionsMap") or {}).values() for s in sl or []]
-    real = {it.get("uuid") for s in secs if s.get("type") != "HORIZONTAL_GRID"
-            for it in ((s.get("payload") or {}).get("standardItemsPayload") or {})
-            .get("catalogItems") or []}
+    # ponytail: 精選商品 / 您專屬的推薦商品 repeat items from the real menu sections and
+    # always come first, with nothing else marking them; so the LAST copy is the real one
+    last = {}
+    for n, it in enumerate(it for s in secs for it in
+                           ((s.get("payload") or {}).get("standardItemsPayload") or {})
+                           .get("catalogItems") or []):
+        last[it.get("uuid")] = n
+    n = -1
     for sec in secs:
-        featured = sec.get("type") == "HORIZONTAL_GRID"
         pl = (sec.get("payload") or {}).get("standardItemsPayload") or {}
         title = _text(pl.get("title"))
         rows = []
         for it in pl.get("catalogItems") or []:
+            n += 1
             row = {
                 "uuid": it.get("uuid"),
                 "title": it.get("title"),
@@ -548,10 +552,8 @@ def parse_store(d):
                 "section_uuid": it.get("sectionUuid"),
                 "subsection_uuid": it.get("subsectionUuid"),
                 "image": it.get("imageUrl"),
-                "duplicate": it.get("uuid") in (real if featured else seen),
+                "duplicate": last[it.get("uuid")] != n,
             }
-            if not featured:
-                seen.add(it.get("uuid"))
             rows.append(row)
         sections.append({"title": title, "count": len(rows)})
         items.extend(rows)
@@ -563,7 +565,8 @@ def parse_store(d):
         "url": f"{ORIGIN}/{LOCALE}/store/{d.get('slug')}/"
                + base64.urlsafe_b64encode(uuidlib.UUID(d["uuid"]).bytes).decode().rstrip("=")
         if d.get("uuid") and d.get("slug") else None,
-        "is_open": d.get("isOpen"),
+        # isOpen means "takes orders", scheduled ones included; closedMessage is set only while closed
+        "is_open": bool(d.get("isOpen")) and not d.get("closedMessage"),
         "is_orderable": d.get("isOrderable"),
         "closed_message": d.get("closedMessage") or "",
         "eta": _text(d.get("etaRange")),
@@ -689,7 +692,7 @@ def cmd_store(args):
 
     def human():
         head = (f"{s['title']}  ({'open' if s['is_open'] else 'CLOSED'}"
-                f"{', ' + s['eta'] if s['eta'] else ''})\n"
+                f"{', ' + s['eta'] if s['eta'] and s['is_open'] else ''})\n"
                 f"{s['url'] or ''}\n")
         if s["closed_message"]:
             head += s["closed_message"] + "\n"
@@ -700,17 +703,23 @@ def cmd_store(args):
     return emit(ok(s), args.json, human)
 
 
+def find_item(s, ref):
+    """Item by UUID, exact title, then substring; real-section copies before featured ones."""
+    items, q = sorted(s["items"], key=lambda i: i["duplicate"]), ref.lower()
+    hit = next((i for i in items if i["uuid"] == ref), None) or \
+        next((i for i in items if (i["title"] or "").lower() == q), None) or \
+        next((i for i in items if q in (i["title"] or "").lower()), None)
+    if not hit:
+        raise ApiError(f"no item matching {ref!r} in {s['title']}")
+    return hit
+
+
 def cmd_item(args):
     sid = store_uuid(args.store)
     with Auto(args) as br:
         s = parse_store(br.api("getStoreV1", {"storeUuid": sid,
                                               "diningMode": args.mode}))
-        q = args.item.lower()
-        hit = next((i for i in s["items"] if i["uuid"] == args.item), None) or \
-            next((i for i in s["items"] if (i["title"] or "").lower() == q), None) or \
-            next((i for i in s["items"] if q in (i["title"] or "").lower()), None)
-        if not hit:
-            raise ApiError(f"no item matching {args.item!r} in {s['title']}")
+        hit = find_item(s, args.item)
         d = br.api("getMenuItemV1", {"itemRequestType": "ITEM", "storeUuid": sid,
                                      "sectionUuid": hit["section_uuid"],
                                      "subsectionUuid": hit["subsection_uuid"],
@@ -730,6 +739,192 @@ def cmd_item(args):
                 out.append(f"  - {o['title']}{extra}" + (" (sold out)" if o["sold_out"] else ""))
         return "\n".join(out)
     return emit(ok(it), args.json, human)
+
+
+def group_uuid(ref):
+    """Accept a group-order link (eats.uber.com/group-orders/<uuid>/join) or the bare UUID."""
+    m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", ref, re.I)
+    if not m:
+        raise ApiError(f"not an Uber Eats group order link: {ref}")
+    return m.group(0).lower()
+
+
+def group_meta(br, gid):
+    """What the join page shows; works before joining (getDraftOrderByUuidV2 does not)."""
+    d = br.api("getJoinGroupOrderMetaV1", {"draftOrderUUID": gid})
+    mine = {o.get("uuid") for o in
+            br.api("getDraftOrdersByEaterUuidV1", {}).get("draftOrders") or []}
+    p = d.get("joinGroupOrderPresentationData") or {}
+    lines = {i.get("icon"): i.get("title") for i in p.get("items") or []}
+    sid = d.get("storeUUID")
+    return {"uuid": gid, "title": p.get("title"), "store": lines.get("STOREFRONT"),
+            "deliver_to": lines.get("LOCATION_MARKER"), "payment": lines.get("MONEY"),
+            "bill_split": d.get("billSplitOption"),
+            # ponytail: anything but CREATOR_PAYS_ALL counts as "you pay" until other values are seen
+            "you_pay": d.get("billSplitOption") != "CREATOR_PAYS_ALL",
+            "joined": gid in mine, "store_uuid": sid,
+            "store_url": f"{ORIGIN}/{LOCALE}/store/x/"
+            + base64.urlsafe_b64encode(uuidlib.UUID(sid).bytes).decode().rstrip("=") if sid else None}
+
+
+def group_order(br, gid):
+    try:
+        return br.api("getDraftOrderByUuidV2", {"draftOrderUUID": gid}).get("draftOrder") or {}
+    except Auth:
+        raise Auth(f"not a member of group order {gid} (run `ubereats group join`), "
+                   "or not signed in")
+
+
+def group_members(do):
+    return [{"name": m.get("name"), "is_creator": m.get("isCreator"), "is_you": m.get("isCurrentUser"),
+             "items": [{"cart_item": x.get("shoppingCartItemUuid"), "title": x.get("title"),
+                        "quantity": x.get("quantity"), "price": money(x.get("price")),
+                        "options": [o.get("title") for os_ in (x.get("customizations") or {}).values()
+                                    for o in os_],
+                        "note": x.get("specialInstructions") or ""}
+                       for x in m.get("items") or []]}
+            for m in (do.get("shoppingCart") or {}).get("groupedItems") or []]
+
+
+def pick_options(m, wanted):
+    """--opt texts -> the customizations map addItemsToGroupDraftOrderV2 takes.
+    Key "<group uuid>+<groupId>"; a nested group (份量 under 少冰) is keyed by its
+    path "<group>+<id>,<option uuid>,<child group>+<id>" like the web app does.
+    An --opt that equals some option title anywhere only matches exactly, so 大
+    never picks 大珍珠; otherwise it matches by substring. Unset required groups
+    take their default options, as the web app does."""
+    def tree(gs):
+        for g in gs or []:
+            for o in g.get("options") or []:
+                yield o
+                yield from tree(o.get("childCustomizationList"))
+    titles = {(o.get("title") or "").lower() for o in tree(m.get("customizationsList"))}
+    left, cust = list(wanted), {}
+
+    def walk(groups, prefix):
+        for g in groups or []:
+            key, opts, picked = f"{prefix}{g['uuid']}+{g.get('groupId')}", g.get("options") or [], []
+            for w in list(left):
+                lw = w.lower()
+                c = [o for o in opts if (o.get("title") or "").lower() == lw] if lw in titles \
+                    else [o for o in opts if lw in (o.get("title") or "").lower()]
+                if len(c) > 1:
+                    raise ApiError(f"--opt {w!r} matches {len(c)} options: "
+                                   + ", ".join(o.get("title") for o in c))
+                if c:
+                    picked.append(c[0])
+                    left.remove(w)
+            lo, hi = g.get("minPermitted") or 0, g.get("maxPermitted")
+            if not picked and lo:
+                picked = [o for o in opts if (o.get("defaultQuantity") or 0) >= 1 and not o.get("isSoldOut")]
+            if len(picked) < lo or (hi is not None and len(picked) > hi):
+                raise ApiError(f"[{g.get('title')}] needs {lo}-{hi} --opt: "
+                               + " / ".join(o.get("title") for o in opts))
+            for o in picked:
+                if o.get("isSoldOut"):
+                    raise ApiError(f"{o.get('title')} is sold out")
+                walk(o.get("childCustomizationList"), f"{key},{o['uuid']},")
+            if picked:
+                cust[key] = [{"uuid": o["uuid"], "price": o.get("price") or 0, "quantity": 1,
+                              "title": o.get("title"), "defaultQuantity": o.get("defaultQuantity") or 0,
+                              "customizationMeta": {"title": g.get("title"), "isPickOne": False}}
+                             for o in picked]
+    walk(m.get("customizationsList"), "")
+    if left:
+        raise ApiError(f"no option matching {', '.join(map(repr, left))} with your other choices")
+    return cust
+
+
+def _members_text(members):
+    out = []
+    for m in members:
+        out.append(f"  {m['name']}" + (" (host)" if m["is_creator"] else "") + (" <- you" if m["is_you"] else ""))
+        for x in m["items"]:
+            out.append(f"    {x['quantity']}x {x['title']} {' / '.join(x['options'])}"
+                       + (f"  [{x['note']}]" if x["note"] else ""))
+    return out
+
+
+def cmd_group(args):
+    gid = group_uuid(args.link)
+    with Auto(args) as br:
+        g = group_meta(br, gid)
+        do = group_order(br, gid) if g["joined"] else {}
+        if args.action == "peek":
+            if do:
+                g.update(state=do.get("state"), expires_at=do.get("expiresAt"),
+                         members=group_members(do))
+            return emit(ok(g), args.json, lambda: "\n".join(
+                [g["title"] or gid, f"  {g['store']}", f"  {g['deliver_to']}",
+                 f"  {g['payment']}" + (f"  [{g['bill_split']}: you pay]" if g["you_pay"] else ""),
+                 f"  {'joined, ' + str(g.get('state')) if g['joined'] else 'not joined'}",
+                 f"  menu: ubereats store {g['store_uuid']}"] + _members_text(g.get("members") or [])))
+
+        if args.action == "join":
+            if g["joined"]:
+                return emit(ok(dict(g, already_joined=True)), args.json, "already in this group order")
+            if not args.yes:
+                return emit(ok(dict(g, dry_run=True)), args.json,
+                            f"would join: {g['title']} ({g['store']}). re-run with --yes")
+            br.api("addMemberToDraftOrderV1", {"draftOrderUuid": gid,
+                                               **({"nickname": args.nickname} if args.nickname else {})})
+            return emit(ok(dict(g, joined=True)), args.json, f"joined {g['title']}")
+
+        if not g["joined"]:
+            raise Auth("join this group order first: ubereats group join <link> --yes")
+        if do.get("state") != "UNORDERED":
+            raise ApiError(f"group order is {do.get('state')}, no longer editable")
+        cart = (do.get("shoppingCart") or {}).get("cartUuid")
+        if not args.item:
+            raise ApiError(f"group {args.action} needs an item", {"usage": True})
+
+        if args.action == "rm":
+            mine = next((m for m in group_members(do) if m["is_you"]), {"items": []})["items"]
+            hits = [x for x in mine if args.item in (x["cart_item"], x["title"])] or \
+                [x for x in mine if args.item.lower() in (x["title"] or "").lower()]
+            if len(hits) != 1:
+                raise ApiError(f"{len(hits)} of your items match {args.item!r}",
+                               {"yours": [f"{x['title']} {x['cart_item']}" for x in mine]})
+            if not args.yes:
+                return emit(ok({"dry_run": True, "remove": hits[0]}), args.json,
+                            f"would remove {hits[0]['title']}. re-run with --yes")
+            br.api("removeItemsFromGroupDraftOrderV2", {"draftOrderUUID": gid, "cartUUID": cart,
+                                                        "shoppingCartItemUUIDs": [hits[0]["cart_item"]]})
+            return emit(ok({"removed": hits[0]}), args.json, f"removed {hits[0]['title']}")
+
+        # add
+        if g["you_pay"] and not args.i_pay:
+            raise ApiError(f"this group is {g['bill_split']}: you pay for what you add. "
+                           "re-run with --i-pay if that is intended")
+        s = parse_store(br.api("getStoreV1", {"storeUuid": g["store_uuid"], "diningMode": "DELIVERY"}))
+        hit = find_item(s, args.item)
+        if hit["sold_out"]:
+            raise ApiError(f"{hit['title']} is sold out")
+        m = br.api("getMenuItemV1", {"itemRequestType": "ITEM", "storeUuid": g["store_uuid"],
+                                     "sectionUuid": hit["section_uuid"],
+                                     "subsectionUuid": hit["subsection_uuid"],
+                                     "menuItemUuid": hit["uuid"]})
+        cust = pick_options(m, args.opt or [])
+        line = {"uuid": hit["uuid"], "shoppingCartItemUuid": str(uuidlib.uuid4()),
+                "storeUuid": g["store_uuid"], "sectionUuid": hit["section_uuid"],
+                "subsectionUuid": hit["subsection_uuid"], "title": m.get("title") or hit["title"],
+                "price": m.get("price"), "quantity": args.qty,
+                "specialInstructions": args.note or "", "customizations": cust}
+        opts = [o["title"] for os_ in cust.values() for o in os_]
+        each = ((m.get("price") or 0) + sum(o["price"] for os_ in cust.values() for o in os_)) / 100
+        summary = {"item": line["title"], "options": opts, "quantity": args.qty,
+                   "each": each, "total": each * args.qty, "note": args.note or "",
+                   "group": g["title"], "you_pay": g["you_pay"]}
+        desc = f"{args.qty}x {line['title']} {' / '.join(opts)}  ${each * args.qty:g}"
+        if not args.yes:
+            return emit(ok(dict(summary, dry_run=True)), args.json,
+                        f"would add to {g['title']}: {desc}. re-run with --yes")
+        r = br.api("addItemsToGroupDraftOrderV2", {"draftOrderUUID": gid, "cartUUID": cart,
+                                                   "items": [line]})
+        if r.get("validationErrors"):
+            raise ApiError("Uber Eats rejected the item", {"validationErrors": r["validationErrors"]})
+        return emit(ok(dict(summary, cart_item=line["shoppingCartItemUuid"])), args.json,
+                    f"added: {desc}")
 
 
 def cmd_raw(args):
@@ -812,11 +1007,24 @@ def cmd_address(args):
     st = load_state()
     st.pop("source", None)
     if args.action == "set":
-        if args.lat is None or args.lng is None:
-            raise ApiError("address set needs --lat and --lng (copy from the store URL's pl= "
-                           "parameter or Google Maps)")
-        st["address"] = {"label": args.label, "lat": args.lat, "lng": args.lng,
-                         "reference": args.place_id or "", "referenceType": "google_places"}
+        if (args.lat is None) != (args.lng is None):
+            raise ApiError("give both --lat and --lng, or neither to look the address up")
+        if args.lat is None:
+            # ponytail: first autocomplete hit, the printed match is the user's check
+            with Auto(args) as br:
+                hits = br.api("mapsSearchV1", {"query": args.label})
+                if not hits:
+                    raise ApiError(f"Uber Eats found no address for {args.label!r}")
+                d = br.api("getDeliveryLocationV1", {"placeId": hits[0]["id"],
+                                                     "provider": hits[0]["provider"],
+                                                     "source": "manual_auto_complete"})
+            st["address"] = {"label": args.label, "lat": d["latitude"], "lng": d["longitude"],
+                             "reference": d.get("reference", ""),
+                             "referenceType": d.get("referenceType", "google_places"),
+                             "matched": (d.get("address") or {}).get("eaterFormattedAddress")}
+        else:
+            st["address"] = {"label": args.label, "lat": args.lat, "lng": args.lng,
+                             "reference": args.place_id or "", "referenceType": "google_places"}
         save_state(st)
     elif args.action == "clear":
         st.pop("address", None)
@@ -832,13 +1040,14 @@ def cmd_address(args):
                          "referenceType": d.get("referenceType", "google_places")}
         save_state(st)
     a = st.get("address")
-    return emit(ok(a), args.json, lambda: f"{a['label']} ({a['lat']}, {a['lng']})" if a else "(no address)")
+    return emit(ok(a), args.json, lambda: f"{a['label']} ({a['lat']}, {a['lng']})"
+                + (f"\nmatched: {a['matched']}" if a.get("matched") else "") if a else "(no address)")
 
 
 def build_parser():
     p = argparse.ArgumentParser(prog="ubereats",
                                 description="Uber Eats Taiwan from the shell "
-                                            "(read-only).")
+                                            "(no checkout).")
     p.add_argument("--version", action="version", version=VERSION)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true",
@@ -904,6 +1113,19 @@ def build_parser():
     it.add_argument("item", help="item UUID or (part of) its name")
     it.add_argument("--mode", default="DELIVERY", choices=["DELIVERY", "PICKUP"])
     it.set_defaults(fn=cmd_item)
+
+    gr = sub.add_parser("group", parents=[common], help="Uber Eats group orders (團購)")
+    gr.add_argument("action", choices=["peek", "join", "add", "rm"])
+    gr.add_argument("link", help="group order link or its UUID")
+    gr.add_argument("item", nargs="?", help="add: item name/UUID; rm: your item's name or cart_item")
+    gr.add_argument("--opt", action="append", help="option text, repeatable (微糖 / 少冰 / 珍珠)")
+    gr.add_argument("--qty", type=int, default=1)
+    gr.add_argument("--note", help="special instructions for the item")
+    gr.add_argument("--nickname", help="join: name shown to the group")
+    gr.add_argument("--yes", action="store_true", help="really write; without it join/add/rm only preview")
+    gr.add_argument("--i-pay", action="store_true",
+                    help="allow add when the group splits the bill (you pay your items)")
+    gr.set_defaults(fn=cmd_group)
 
     r = sub.add_parser("raw", parents=[common],
                        help="call a read-only /_p/api get* endpoint")
