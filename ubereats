@@ -370,7 +370,7 @@ def load_state():
     except (OSError, ValueError) as e:
         raise ApiError(f"state file unreadable: {e}")
     if os.environ.get("UBEREATS_COOKIE"):
-        st["cookie"], st["source"] = os.environ["UBEREATS_COOKIE"].strip(), "env"
+        st["cookie"], st["source"] = clean_cookie(os.environ["UBEREATS_COOKIE"]), "env"
     elif st.get("cookie_in_keyring"):
         st["cookie"], st["source"] = _keyring("get"), "keyring"
     elif st.get("cookie"):
@@ -987,6 +987,27 @@ def cmd_raw(args):
     return emit(ok(d), True)
 
 
+COOKIE_PAIR = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+=[\x21-\x7e]*$")
+
+
+def clean_cookie(raw):
+    """Keep only valid name=value pairs; refuse text that is not a Cookie header."""
+    raw = (raw or "").strip()
+    if raw.lower().startswith("cookie:"):
+        raw = raw.split(":", 1)[1].strip()
+    pairs = [p.strip() for p in raw.replace("\n", ";").split(";")]
+    good = [p for p in pairs if p and COOKIE_PAIR.match(p)]
+    bad = [p for p in pairs if p and not COOKIE_PAIR.match(p)]
+    if not good or not any(p.startswith(("jwt-session=", "sid=", "csid=")) for p in good):
+        preview = raw[:40].encode("ascii", "replace").decode()
+        raise Auth("that does not look like an Uber Eats Cookie header "
+                   f"(starts with {preview!r}). In DevTools > Network, click a ubereats.com "
+                   "request > Headers > Request Headers, copy the value of `Cookie`")
+    if bad:
+        print(f"note: dropped {len(bad)} malformed cookie part(s)", file=sys.stderr)
+    return "; ".join(good)
+
+
 def _verify(cookie, debug):
     try:
         u = Http({"cookie": cookie}, debug).api("getUserV1", {})
@@ -1057,10 +1078,7 @@ def cmd_login(args):
         src = "stdin"
     else:
         raise ApiError("pick --from-browser, --from-clipboard or --cookie-stdin", {"usage": True})
-    if cookie.lower().startswith("cookie:"):
-        cookie = cookie.split(":", 1)[1].strip()
-    if not cookie:
-        raise Auth("empty cookie")
+    cookie = clean_cookie(cookie)
     u = _verify(cookie, args.debug)
     st = load_state()
     st.pop("source", None)
