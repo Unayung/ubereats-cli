@@ -35,7 +35,8 @@ and search ranking. Without it Uber Eats guesses from your IP.
 Login (Uber uses phone/email one-time codes plus bot checks, so no password
 login here): sign in once in any browser, then either
   ubereats login --from-browser [--cdp http://127.0.0.1:9222]
-  ubereats login --cookie-stdin     (paste DevTools' Cookie request header)
+  ubereats login --from-clipboard   (copy DevTools' Cookie request header first)
+  ubereats login --cookie-stdin     (paste it; long pastes are read raw, input hidden)
 The cookie is verified with getUserV1 before it is saved to
 ~/.config/ubereats/state.json (0600), or to the OS keyring with --keyring
 (macOS `security`, Linux `secret-tool`). UBEREATS_COOKIE overrides both.
@@ -997,6 +998,50 @@ def _verify(cookie, debug):
     return u
 
 
+def _read_cookie_tty():
+    """Read one long line from a terminal.
+
+    The Linux tty line editor (canonical mode) holds at most 4095 bytes per line; a longer
+    paste fills it and Enter is then ignored. Uber Eats cookies are often ~5-8 KB, so turn
+    canonical mode off and read the bytes ourselves until Enter.
+    """
+    import termios
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    new = termios.tcgetattr(fd)
+    new[3] &= ~(termios.ICANON | termios.ECHO)
+    new[6][termios.VMIN], new[6][termios.VTIME] = 1, 0
+    print("paste the Cookie header, then press Enter (input hidden):", file=sys.stderr)
+    buf = bytearray()
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+        while True:
+            ch = os.read(fd, 65536)
+            if not ch:
+                break
+            if b"\x03" in ch:
+                raise KeyboardInterrupt
+            buf += ch
+            if b"\r" in ch or b"\n" in ch:
+                break
+            print(f"\r{len(buf)} bytes", end="", file=sys.stderr, flush=True)
+    finally:
+        termios.tcsetattr(fd, termios.TCSANOW, old)
+        print(file=sys.stderr)
+    return buf.decode("utf-8", "replace").splitlines()[0] if buf else ""
+
+
+def _clipboard():
+    for cmd in (["wl-paste", "-n"], ["pbpaste"], ["xclip", "-o", "-selection", "clipboard"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    raise Auth("clipboard is empty or no clipboard tool (wl-paste / pbpaste / xclip)")
+
+
 def cmd_login(args):
     if args.from_browser:
         with Browser(args.debug, args.cdp) as br:
@@ -1004,13 +1049,16 @@ def cmd_login(args):
         cookie = "; ".join(f"{c['name']}={c['value']}" for c in cks
                            if c["name"] != "uev2.loc")
         src = f"browser {args.cdp or CDP}"
+    elif args.from_clipboard:
+        cookie = _clipboard()
+        src = "clipboard"
     elif args.cookie_stdin:
-        cookie = sys.stdin.readline().strip()
-        if cookie.lower().startswith("cookie:"):
-            cookie = cookie.split(":", 1)[1].strip()
+        cookie = (_read_cookie_tty() if sys.stdin.isatty() else sys.stdin.read()).strip()
         src = "stdin"
     else:
-        raise ApiError("pick --from-browser or --cookie-stdin", {"usage": True})
+        raise ApiError("pick --from-browser, --from-clipboard or --cookie-stdin", {"usage": True})
+    if cookie.lower().startswith("cookie:"):
+        cookie = cookie.split(":", 1)[1].strip()
     if not cookie:
         raise Auth("empty cookie")
     u = _verify(cookie, args.debug)
@@ -1118,7 +1166,9 @@ def build_parser():
     g.add_argument("--from-browser", action="store_true",
                    help="copy the session from a CDP browser where you signed in")
     g.add_argument("--cookie-stdin", action="store_true",
-                   help="read a DevTools Cookie request header from stdin")
+                   help="paste a DevTools Cookie request header (or pipe it in)")
+    g.add_argument("--from-clipboard", action="store_true",
+                   help="read the Cookie header from the clipboard (copy it in DevTools first)")
     lg.add_argument("--cdp", help=f"CDP endpoint (default {CDP})")
     lg.add_argument("--keyring", action="store_true",
                     help="store the cookie in the OS keyring, not the state file")

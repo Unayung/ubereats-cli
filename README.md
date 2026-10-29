@@ -13,7 +13,8 @@ Sign in once in any browser, then save that session:
 
 ```
 ubereats login --from-browser [--cdp http://127.0.0.1:9222] [--keyring]
-ubereats login --cookie-stdin [--keyring]   # paste DevTools "Cookie:" header
+ubereats login --from-clipboard [--keyring] # copy DevTools "Cookie:" header first
+ubereats login --cookie-stdin [--keyring]   # or paste it (works for >4 KB cookies)
 ubereats whoami | logout
 ```
 
