@@ -775,6 +775,19 @@ def group_order(br, gid):
                    "or not signed in")
 
 
+def group_closed(do):
+    """Why a group order you are in no longer takes items, else None. state stays
+    UNORDERED after the host locks the cart or the group expires."""
+    if do.get("state") != "UNORDERED":
+        return do.get("state")
+    if (do.get("shoppingCart") or {}).get("cartState") == "LOCKED":
+        return "LOCKED"
+    # same ISO-8601 UTC layout on both sides, so string order is time order
+    if (do.get("expiresAt") or "~")[:19] < time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()):
+        return "EXPIRED"
+    return None
+
+
 def group_members(do):
     return [{"name": m.get("name"), "is_creator": m.get("isCreator"), "is_you": m.get("isCurrentUser"),
              "items": [{"cart_item": x.get("shoppingCartItemUuid"), "title": x.get("title"),
@@ -846,18 +859,39 @@ def _members_text(members):
 
 
 def cmd_group(args):
+    if args.action == "list":
+        with Auto(args) as br:
+            rows = []
+            for d in br.api("getDraftOrdersByEaterUuidV1", {}).get("draftOrders") or []:
+                p = br.api("getJoinGroupOrderMetaV1", {"draftOrderUUID": d.get("uuid")}
+                           ).get("joinGroupOrderPresentationData") or {}
+                store = next((i.get("title") for i in p.get("items") or []
+                              if i.get("icon") == "STOREFRONT"), None)
+                rows.append({"uuid": d.get("uuid"), "title": d.get("displayName"), "store": store,
+                             "host": d.get("isUserCreator"), "created_at": d.get("createdAt"),
+                             "closed": group_closed(d),
+                             "members": (d.get("shoppingCart") or {}).get("numMembers")})
+        return emit(ok(rows), args.json, lambda: table(
+            [[r["title"], clip(r["store"], 24), r["closed"] or "open", (r["created_at"] or "")[:10],
+              r["uuid"]] for r in rows], ["group", "store", "state", "created", "uuid"])
+            if rows else "(no group orders)")
+    if not args.link:
+        raise ApiError(f"group {args.action} needs a group order link", {"usage": True})
     gid = group_uuid(args.link)
     with Auto(args) as br:
         g = group_meta(br, gid)
         do = group_order(br, gid) if g["joined"] else {}
         if args.action == "peek":
             if do:
-                g.update(state=do.get("state"), expires_at=do.get("expiresAt"),
-                         members=group_members(do))
+                g.update(state=do.get("state"), closed=group_closed(do),
+                         expires_at=do.get("expiresAt"), members=group_members(do))
+            # ponytail: non-members cannot see open/closed; every read endpoint needs membership
+            status = (f"joined, {g['closed'] or 'open'}" if do else
+                      "not joined (whether it is still open shows only after joining)")
             return emit(ok(g), args.json, lambda: "\n".join(
                 [g["title"] or gid, f"  {g['store']}", f"  {g['deliver_to']}",
                  f"  {g['payment']}" + (f"  [{g['bill_split']}: you pay]" if g["you_pay"] else ""),
-                 f"  {'joined, ' + str(g.get('state')) if g['joined'] else 'not joined'}",
+                 f"  {status}",
                  f"  menu: ubereats store {g['store_uuid']}"] + _members_text(g.get("members") or [])))
 
         if args.action == "join":
@@ -868,12 +902,27 @@ def cmd_group(args):
                             f"would join: {g['title']} ({g['store']}). re-run with --yes")
             br.api("addMemberToDraftOrderV1", {"draftOrderUuid": gid,
                                                **({"nickname": args.nickname} if args.nickname else {})})
-            return emit(ok(dict(g, joined=True)), args.json, f"joined {g['title']}")
+            closed = group_closed(group_order(br, gid))
+            return emit(ok(dict(g, joined=True, closed=closed)), args.json,
+                        f"joined {g['title']}" + (f", but it is {closed}" if closed else ""))
 
         if not g["joined"]:
-            raise Auth("join this group order first: ubereats group join <link> --yes")
-        if do.get("state") != "UNORDERED":
-            raise ApiError(f"group order is {do.get('state')}, no longer editable")
+            raise Auth("not in this group order (join: ubereats group join <link> --yes)")
+        if args.action == "leave":
+            if not args.yes:
+                return emit(ok(dict(g, dry_run=True)), args.json,
+                            f"would leave: {g['title']} ({g['store']}). re-run with --yes")
+            br.api("removeMemberFromDraftOrderV1", {"draftOrderUuid": gid, "shouldClearCookies": False})
+            # the reply is a bare success even when nothing changed (seen on a LOCKED, expired group)
+            if gid in {o.get("uuid") for o in
+                       br.api("getDraftOrdersByEaterUuidV1", {}).get("draftOrders") or []}:
+                raise ApiError(f"Uber Eats accepted the leave but you are still in the group "
+                               f"({group_closed(do) or 'open'})")
+            return emit(ok(dict(g, joined=False)), args.json, f"left {g['title']}")
+
+        closed = group_closed(do)
+        if closed:
+            raise ApiError(f"group order is {closed}, no longer editable")
         cart = (do.get("shoppingCart") or {}).get("cartUuid")
         if not args.item:
             raise ApiError(f"group {args.action} needs an item", {"usage": True})
@@ -1115,14 +1164,14 @@ def build_parser():
     it.set_defaults(fn=cmd_item)
 
     gr = sub.add_parser("group", parents=[common], help="Uber Eats group orders (團購)")
-    gr.add_argument("action", choices=["peek", "join", "add", "rm"])
-    gr.add_argument("link", help="group order link or its UUID")
+    gr.add_argument("action", choices=["list", "peek", "join", "leave", "add", "rm"])
+    gr.add_argument("link", nargs="?", help="group order link or its UUID (all but list)")
     gr.add_argument("item", nargs="?", help="add: item name/UUID; rm: your item's name or cart_item")
     gr.add_argument("--opt", action="append", help="option text, repeatable (微糖 / 少冰 / 珍珠)")
     gr.add_argument("--qty", type=int, default=1)
     gr.add_argument("--note", help="special instructions for the item")
     gr.add_argument("--nickname", help="join: name shown to the group")
-    gr.add_argument("--yes", action="store_true", help="really write; without it join/add/rm only preview")
+    gr.add_argument("--yes", action="store_true", help="really write; without it join/leave/add/rm only preview")
     gr.add_argument("--i-pay", action="store_true",
                     help="allow add when the group splits the bill (you pay your items)")
     gr.set_defaults(fn=cmd_group)

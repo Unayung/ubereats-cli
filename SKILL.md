@@ -21,11 +21,12 @@ source for `login --from-browser`. Run `ubereats doctor` first on a new machine.
 - Store URL last segment is the store UUID in url-safe base64.
 
 Group orders (link `eats.uber.com/group-orders/<uuid>/join`, often posted in Slack):
-1. `ubereats group peek <link> --json` — store, `you_pay`, `joined`; once joined also `state`, members, items
+1. `ubereats group peek <link> --json` — store, `you_pay`, `joined`; once joined also `closed`
+   (null = open), members, items. Non-members cannot see if it is open. `group list` = groups you are in
 2. `ubereats store <store_uuid> --grep ..` / `ubereats item <store_uuid> <name>` to pick options
 3. Show the user the store, item, options and price; only after they say yes:
    `ubereats group join <link> --yes`, then `ubereats group add <link> <item> --opt .. --yes`
-4. `group rm <link> <item> --yes` undoes an add. Never pass `--i-pay` unless the user asked to pay.
+4. `group rm <link> <item> --yes` undoes an add; `group leave <link> --yes` leaves (ask first). Never pass `--i-pay` unless the user asked to pay.
 
 Pitfalls: without a saved session getUserV1 / draft orders fail (exit 3). Without an
 address, stores may say 目前不接受訂單 because Uber Eats guesses the location from IP.
