@@ -799,7 +799,7 @@ def group_members(do):
                                 for os_ in (x.get("customizations") or {}).values() for o in os_)),
                         "options": [o.get("title") for os_ in (x.get("customizations") or {}).values()
                                     for o in os_],
-                        "note": x.get("specialInstructions") or ""}
+                        "note": x.get("specialInstructions") or "", "image": x.get("imageURL")}
                        for x in m.get("items") or []]}
             for m in (do.get("shoppingCart") or {}).get("groupedItems") or []]
 
