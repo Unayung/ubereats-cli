@@ -792,7 +792,11 @@ def group_closed(do):
 def group_members(do):
     return [{"name": m.get("name"), "is_creator": m.get("isCreator"), "is_you": m.get("isCurrentUser"),
              "items": [{"cart_item": x.get("shoppingCartItemUuid"), "title": x.get("title"),
-                        "quantity": x.get("quantity"), "price": money(x.get("price")),
+                        # unit price incl. add-ons (+$10 珍珠); x.price alone is the base item
+                        "quantity": x.get("quantity"), "price": money(
+                            None if x.get("price") is None else x["price"] + sum(
+                                (o.get("price") or 0) * (o.get("quantity") or 1)
+                                for os_ in (x.get("customizations") or {}).values() for o in os_)),
                         "options": [o.get("title") for os_ in (x.get("customizations") or {}).values()
                                     for o in os_],
                         "note": x.get("specialInstructions") or ""}
@@ -855,6 +859,7 @@ def _members_text(members):
         out.append(f"  {m['name']}" + (" (host)" if m["is_creator"] else "") + (" <- you" if m["is_you"] else ""))
         for x in m["items"]:
             out.append(f"    {x['quantity']}x {x['title']} {' / '.join(x['options'])}"
+                       + (f"  ${x['price']:g}" if x["price"] is not None else "")
                        + (f"  [{x['note']}]" if x["note"] else ""))
     return out
 
