@@ -41,9 +41,19 @@ The cookie is verified with getUserV1 before it is saved to
 ~/.config/ubereats/state.json (0600), or to the OS keyring with --keyring
 (macOS `security`, Linux `secret-tool`). UBEREATS_COOKIE overrides both.
 
+Group orders (measured 2026-11-05 from the web app):
+  createDraftOrderV2   {groupOrderStoreUUID, billSplitOption, displayName,
+                        spendingLimit:"<TWD>"|"", cartLockOptions:{autoSubmit:false,
+                        deadline:{lockAtInMs}}, addParticipantsIntended:true, ...}
+                        paymentProfileUUID is optional (the web app takes it from
+                        payments.ubereats.com); without it the host picks at checkout
+  discardDraftOrdersV1 {draftOrderUUIDs:[uuid], storeUUID}   host cancels
+  billSplitOption: CREATOR_PAYS_ALL | SPLIT_BY_SUBTOTAL | SPONSORED_BY_ORG (business)
+
 Unofficial. Undocumented, private API - it can break without warning.
-No checkout by design. The only writes are group orders: join one and
-add/remove your own items (`group join|add|rm`, each needs --yes).
+No checkout by design. The only writes are group orders: create and cancel
+your own, join one and add/remove your own items (`group create|cancel|join|
+add|rm`, each needs --yes). A created group never auto-submits at its deadline.
 """
 from __future__ import annotations
 
@@ -742,6 +752,97 @@ def cmd_item(args):
     return emit(ok(it), args.json, human)
 
 
+GROUP_LINK = "https://eats.uber.com/group-orders/{}/join"
+# billSplitOption values in the web app (2026-11-05); SPONSORED_BY_ORG is Uber for Business only
+BILL_SPLIT = {"host": "CREATOR_PAYS_ALL", "split": "SPLIT_BY_SUBTOTAL"}
+
+
+def parse_deadline(text, now=None):
+    """--deadline -> cartLockOptions.deadline.lockAtInMs (ms), or None for no deadline.
+    HH:MM is today in local time; 45m / 2h count from now. The default matches the
+    web app: an hour from now, rounded up to 5 minutes."""
+    now = time.time() if now is None else now
+    if text is None:
+        return int(-(-(now + 3600) // 300) * 300) * 1000
+    t = text.strip().lower()
+    if t in ("none", "no", "off"):
+        return None
+    m = re.fullmatch(r"(\d+)\s*(m|min|h|hr)", t)
+    if m:
+        secs = int(m.group(1)) * (3600 if m.group(2).startswith("h") else 60)
+        return int(-(-(now + secs) // 60) * 60) * 1000
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
+    if m:
+        lt = time.localtime(now)
+        at = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, int(m.group(1)), int(m.group(2)),
+                          0, 0, 0, -1))
+        if at <= now:
+            raise ApiError(f"--deadline {text} has already passed today")
+        return int(at) * 1000
+    raise ApiError(f"--deadline {text!r}: use HH:MM, 45m, 2h or none", {"usage": True})
+
+
+def group_create(args, br):
+    sid = store_uuid(args.link)
+    if not br.st.get("cookie"):
+        raise Auth("not signed in - run `ubereats login`")
+    s = parse_store(br.api("getStoreV1", {"storeUuid": sid, "diningMode": "DELIVERY"}))
+    addr = (br.st.get("address") or {}).get("label")
+    if s["within_delivery_range"] is False:
+        raise ApiError(f"{s['title']} does not deliver to {addr or 'your Uber Eats address'}")
+    lock = parse_deadline(args.deadline)
+    if args.limit is not None and args.limit <= 0:
+        raise ApiError("--limit must be a positive amount in TWD")
+    name = args.name or f"{(br.st.get('user') or {}).get('first_name') or '我'} 的團購訂單"
+    split = BILL_SPLIT["split" if args.split else "host"]
+    plan = {"name": name, "store": s["title"], "store_uuid": sid, "store_url": s["url"],
+            "is_open": s["is_open"], "closed_message": s["closed_message"], "eta": s["eta"],
+            "deliver_to": addr, "bill_split": split, "host_pays_all": not args.split,
+            "spending_limit": args.limit,
+            "deadline": time.strftime("%Y-%m-%d %H:%M", time.localtime(lock / 1000)) if lock else None}
+
+    def describe(p):
+        return [f"  store     {p['store']}" + ("" if p["is_open"] else
+                                                   f"  (CLOSED now: {p['closed_message'] or 'not taking orders'})"),
+                f"  deliver   {p['deliver_to'] or '(Uber Eats account default)'}",
+                f"  pays      {'you pay for everyone' if p['host_pays_all'] else 'each member pays their own items'}"
+                + (f", up to ${p['spending_limit']:g} per person" if p["spending_limit"] else ""),
+                f"  deadline  {p['deadline'] or 'none'} (cart locks then; nothing is ordered automatically)"]
+    if not args.yes:
+        return emit(ok(dict(plan, dry_run=True)), args.json,
+                    lambda: "\n".join([f"would create group order {name!r}:"] + describe(plan)
+                                      + ["re-run with --yes"]))
+    body = {"isMulticart": True, "shoppingCartItems": [], "useCredits": True,
+            "extraPaymentProfiles": [],
+            "promotionOptions": {"autoApplyPromotionUUIDs": [], "selectedPromotionInstanceUUIDs": [],
+                                 "skipApplyingPromotion": False},
+            "deliveryTime": {"asap": True}, "deliveryType": "ASAP",
+            "groupOrderStoreUUID": sid,
+            # a string in whole currency units, "" for no limit (web app form)
+            "spendingLimit": f"{args.limit:g}" if args.limit else "",
+            "currencyCode": s["currency"] or "TWD", "addParticipantsIntended": True,
+            "interactionType": "door_to_door", "billSplitOption": split, "displayName": name,
+            "checkMultipleDraftOrdersCap": True, "businessDetails": {}}
+    if args.payment:
+        body["paymentProfileUUID"] = args.payment
+    if lock:
+        # autoSubmit stays False: True would place the order by itself at the deadline
+        body["cartLockOptions"] = {"autoSubmit": False, "deadline": {"lockAtInMs": lock}}
+    r = br.api("createDraftOrderV2", body)
+    do = r.get("draftOrder") or {}
+    if r.get("validationErrors") or not do.get("uuid"):
+        raise ApiError("Uber Eats did not create the group order",
+                       {"validationErrors": r.get("validationErrors")})
+    da = do.get("deliveryAddress") or {}
+    a = da.get("address") or {}
+    out = dict(plan, uuid=do["uuid"], link=GROUP_LINK.format(do["uuid"]),
+               deliver_to=" ".join(x for x in (a.get("title"), a.get("subtitle")) if x) or addr,
+               payment_profile=do.get("paymentProfileUUID") or None)
+    return emit(ok(out), args.json, lambda: "\n".join(
+        [f"created {name!r}", f"  link      {out['link']}"] + describe(out)
+        + ["place the order from the Uber Eats app once everyone has added items"]))
+
+
 def group_uuid(ref):
     """Accept a group-order link (eats.uber.com/group-orders/<uuid>/join) or the bare UUID."""
     m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", ref, re.I)
@@ -882,7 +983,12 @@ def cmd_group(args):
               r["uuid"]] for r in rows], ["group", "store", "state", "created", "uuid"])
             if rows else "(no group orders)")
     if not args.link:
-        raise ApiError(f"group {args.action} needs a group order link", {"usage": True})
+        raise ApiError(f"group {args.action} needs a "
+                       + ("store URL or UUID" if args.action == "create" else "group order link"),
+                       {"usage": True})
+    if args.action == "create":
+        with Auto(args) as br:
+            return group_create(args, br)
     gid = group_uuid(args.link)
     with Auto(args) as br:
         g = group_meta(br, gid)
@@ -925,6 +1031,23 @@ def cmd_group(args):
                 raise ApiError(f"Uber Eats accepted the leave but you are still in the group "
                                f"({group_closed(do) or 'open'})")
             return emit(ok(dict(g, joined=False)), args.json, f"left {g['title']}")
+
+        if args.action == "cancel":
+            if not (do.get("isUserCreator") or (do.get("shoppingCart") or {}).get("isOwner")):
+                raise ApiError("only the host can cancel a group order; use `group leave`")
+            if do.get("state") != "UNORDERED":
+                raise ApiError(f"group order is {do.get('state')}, cannot cancel it here")
+            members = group_members(do)
+            items = sum(len(m["items"]) for m in members)
+            name = do.get("displayName") or g["title"]
+            if not args.yes:
+                return emit(ok(dict(g, dry_run=True, members=members)), args.json, lambda: "\n".join(
+                    [f"would cancel {name} ({g['store']}): {len(members)} member(s), "
+                     f"{items} item(s) are dropped"] + _members_text(members) + ["re-run with --yes"]))
+            r = br.api("discardDraftOrdersV1", {"draftOrderUUIDs": [gid], "storeUUID": g["store_uuid"]})
+            if gid not in (r.get("discardedDraftOrderUUIDs") or []):
+                raise ApiError("Uber Eats did not cancel the group order", {"reply": r})
+            return emit(ok(dict(g, cancelled=True)), args.json, f"cancelled {name}")
 
         closed = group_closed(do)
         if closed:
@@ -1237,14 +1360,24 @@ def build_parser():
     it.set_defaults(fn=cmd_item)
 
     gr = sub.add_parser("group", parents=[common], help="Uber Eats group orders (團購)")
-    gr.add_argument("action", choices=["list", "peek", "join", "leave", "add", "rm"])
-    gr.add_argument("link", nargs="?", help="group order link or its UUID (all but list)")
+    gr.add_argument("action", choices=["list", "create", "peek", "join", "leave", "add", "rm", "cancel"])
+    gr.add_argument("link", nargs="?",
+                    help="group order link or its UUID; create: store URL or UUID; list: none")
     gr.add_argument("item", nargs="?", help="add: item name/UUID; rm: your item's name or cart_item")
     gr.add_argument("--opt", action="append", help="option text, repeatable (微糖 / 少冰 / 珍珠)")
     gr.add_argument("--qty", type=int, default=1)
     gr.add_argument("--note", help="special instructions for the item")
     gr.add_argument("--nickname", help="join: name shown to the group")
-    gr.add_argument("--yes", action="store_true", help="really write; without it join/leave/add/rm only preview")
+    gr.add_argument("--name", help="create: group name (default '<your name> 的團購訂單')")
+    gr.add_argument("--deadline",
+                    help="create: when the cart locks - HH:MM today, 45m, 2h, or none "
+                         "(default: an hour from now)")
+    gr.add_argument("--limit", type=int, help="create: spending limit per person, TWD")
+    gr.add_argument("--split", action="store_true",
+                    help="create: each member pays for their own items (default: you pay for all)")
+    gr.add_argument("--payment", help="create: payment profile UUID (default: Uber Eats picks)")
+    gr.add_argument("--yes", action="store_true",
+                    help="really write; without it create/cancel/join/leave/add/rm only preview")
     gr.add_argument("--i-pay", action="store_true",
                     help="allow add when the group splits the bill (you pay your items)")
     gr.set_defaults(fn=cmd_group)

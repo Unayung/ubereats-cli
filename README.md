@@ -63,7 +63,22 @@ after joining (`joined, open`; else `LOCKED`, `EXPIRED` or the order state). sta
 `UNORDERED` after the host locks the cart, so add/rm check the lock and expiry too. Uber Eats
 answers `leave` with success on a locked group yet keeps you in; `leave` re-checks and says so.
 
+Hosting a group order (開團):
+
+```
+ubereats group create <store> --yes    # prints the join link to share
+      [--name 午餐團] [--deadline 12:30|45m|2h|none] [--limit 200] [--split] [--payment UUID]
+ubereats group cancel <link> --yes     # host only; drops everyone's items
+```
+
+`create` delivers to the saved `address` (else the Uber Eats account default). By default you
+pay for everyone (`CREATOR_PAYS_ALL`); `--split` makes each member pay their own items
+(`SPLIT_BY_SUBTOTAL`). `--limit` is per person, in TWD. `--deadline` locks the cart (default:
+an hour from now, rounded up to 5 minutes, like the web app); the group never auto-submits.
+Without `--payment` no payment profile is set and you pick one at checkout. Placing the order
+stays in the Uber Eats app.
+
 Every command takes `--json` → `{ok, data|error}`. Exit codes: 0 ok, 1 api, 3 auth, 4 net/blocked.
 
-No checkout by design: the only writes are joining a group order and adding/removing your own
-items in it. The group host places and pays for the order. Unofficial private API — may break anytime.
+No checkout by design: the only writes are creating/cancelling your own group order, joining
+one, and adding/removing your own items in it. The host places and pays for the order in the app. Unofficial private API — may break anytime.

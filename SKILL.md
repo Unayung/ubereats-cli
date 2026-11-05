@@ -1,6 +1,6 @@
 ---
 name: ubereats
-description: Use when checking Uber Eats Taiwan stores, menus, prices, or item options, or joining an Uber Eats group order (團購, eats.uber.com/group-orders/... link) and adding items to it.
+description: Use when checking Uber Eats Taiwan stores, menus, prices, or item options, starting (開團) or cancelling an Uber Eats group order, or joining one (團購, eats.uber.com/group-orders/... link) and adding items to it.
 ---
 
 # ubereats — Uber Eats Taiwan from a shell (no checkout)
@@ -27,6 +27,13 @@ Group orders (link `eats.uber.com/group-orders/<uuid>/join`, often posted in Sla
 3. Show the user the store, item, options and price; only after they say yes:
    `ubereats group join <link> --yes`, then `ubereats group add <link> <item> --opt .. --yes`
 4. `group rm <link> <item> --yes` undoes an add; `group leave <link> --yes` leaves (ask first). Never pass `--i-pay` unless the user asked to pay.
+
+Hosting (開團) when the user asks to start a group order:
+1. Pick the store with the user (`search`, `store`); confirm name, deadline, who pays
+2. `ubereats group create <store> [--deadline 12:30] [--split] [--limit 200]` previews; after the
+   user says yes add `--yes` and give them the printed `link` to share. Default: they pay for everyone
+3. `group peek <link>` shows who joined and what they added; `group cancel <link> --yes` (ask first)
+   drops the group. Placing the order happens in the Uber Eats app; the CLI never checks out
 
 Pitfalls: without a saved session getUserV1 / draft orders fail (exit 3). Without an
 address, stores may say 目前不接受訂單 because Uber Eats guesses the location from IP.
